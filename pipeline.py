@@ -34,7 +34,7 @@ def increment_daily_count():
     count_file.write_text(f"{today_str}:{count + 1}", encoding="utf-8")
 
 def get_twitch_token():
-    r = requests.post("https://twitch.tv", data={
+    r = requests.post("https://id.twitch.tv/oauth2/token", data={
         "client_id": os.environ["TWITCH_CLIENT_ID"],
         "client_secret": os.environ["TWITCH_CLIENT_SECRET"],
         "grant_type": "client_credentials",
@@ -44,7 +44,7 @@ def get_twitch_token():
 
 def get_gta6_game_id(token):
     headers = {"Client-ID": os.environ["TWITCH_CLIENT_ID"], "Authorization": f"Bearer {token}"}
-    r = requests.get("https://twitch.tv",
+    r = requests.get("https://api.twitch.tv/helix/games",
                      headers=headers, params={"name": "Grand Theft Auto VI"}, timeout=15)
     r.raise_for_status()
     data = r.json().get("data", [])
@@ -53,7 +53,7 @@ def get_gta6_game_id(token):
 def fetch_todays_top_clip(token, game_id):
     headers = {"Client-ID": os.environ["TWITCH_CLIENT_ID"], "Authorization": f"Bearer {token}"}
     started_at = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    r = requests.get("https://twitch.tv", headers=headers, params={
+    r = requests.get("https://api.twitch.tv/helix/clips", headers=headers, params={
         "game_id": game_id,
         "started_at": started_at,
         "first": 20,
@@ -99,7 +99,7 @@ def upload_youtube(video_path, title):
     creds = Credentials(
         token=None,
         refresh_token=os.environ["YT_REFRESH_TOKEN"],
-        token_uri="https://googleapis.com",
+        token_uri="https://oauth2.googleapis.com/token",
         client_id=os.environ["YT_CLIENT_ID"],
         client_secret=os.environ["YT_CLIENT_SECRET"],
     )
