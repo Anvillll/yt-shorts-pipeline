@@ -493,6 +493,7 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
     """
     Calls Google AI Studio Gemini API (gemini-2.5-flash via google-genai SDK)
     to generate viral hook_title, yt_title, and ig_caption.
+    Uses v1beta API version to support JSON mode and newer endpoints cleanly.
     Falls back gracefully if key missing or call fails.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -501,22 +502,23 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
         return fallback_metadata(broadcaster, raw_title)
 
     prompt = (
-        f"You are a viral social media gaming content specialist creating YouTube Shorts and Instagram Reels "
-        f"for Grand Theft Auto VI (GTA 6).\n\n"
-        f"Streamer: {broadcaster}\n"
-        f"Twitch Clip Title: {raw_title}\n"
-        f"Spoken Audio Transcript: {transcript}\n\n"
-        f"Generate high-engagement viral copy. Return a JSON object with EXACTLY these three fields:\n"
-        f"1. 'hook_title': A curiosity-inducing, punchy 2-line hook formatted with '\\N' as the line break "
-        f"(max 26 characters per line, max 52 characters total, standard ASCII only, no emojis, ALL CAPS preferred, "
-        f"e.g. 'CASEOH COULDN'T BELIEVE\\NWHAT HAPPENED IN GTA 6').\n"
-        f"2. 'yt_title': Highly clickable YouTube Shorts title under 80 characters, ending with '#Shorts'.\n"
-        f"3. 'ig_caption': Engaging Instagram caption summary + 12-15 high-reach GTA 6 gaming hashtags.\n\n"
-        f"Return ONLY raw valid JSON, no markdown formatting."
+        f"You are an expert viral gaming content creator specializing in Grand Theft Auto VI (GTA 6) Shorts and Reels.\n\n"
+        f"Twitch Streamer: {broadcaster}\n"
+        f"Original Clip Title: {raw_title}\n"
+        f"Spoken Transcript: {transcript}\n\n"
+        f"Based on this context, return a strictly valid JSON object with EXACTLY these three fields:\n"
+        f"1. 'hook_title': A bold, curiosity-driven 2-line on-screen hook for the middle seam of the video. "
+        f"Maximum 48 characters total, separated by '\\N' for the line break (e.g. 'LINE 1\\NLINE 2'). "
+        f"Strictly uppercase standard ASCII letters, numbers, and basic punctuation only. NO emojis, NO underscores.\n"
+        f"2. 'yt_title': A catchy, high-CTR YouTube Shorts title under 75 characters that sparks immense curiosity and ends with '#Shorts'.\n"
+        f"3. 'ig_caption': A 2-line engaging Instagram Reels caption summarizing the funny or crazy moment with a call-to-action "
+        f"(such as 'Follow for daily GTA 6 clips!'), followed by a blank line and 12-15 relevant high-reach gaming/GTA VI hashtags "
+        f"(e.g. #GTAVI #GTA6 #GrandTheftAuto6 #TwitchClips #GamingClips #Reels).\n\n"
+        f"Return ONLY the raw JSON object, without markdown formatting or code blocks."
     )
 
     try:
-        client = genai.Client(api_key=gemini_key)
+        client = genai.Client(api_key=gemini_key, http_options={"api_version": "v1beta"})
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=prompt,
@@ -527,14 +529,24 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
         text = response.text.strip()
         data = json.loads(text)
 
-        hook_title = data.get("hook_title", "").strip()
-        # Ensure ASCII only and sanitize newlines for ASS subtitle
-        hook_title = "".join(c for c in hook_title if 32 <= ord(c) < 127 or c in ['\n', '\\'])
-        hook_title = hook_title.replace("\n", "\\N")
+        hook_title = data.get("hook_title", "").strip().upper()
+        # Clean to standard ASCII, replace actual newlines with \N, strip unwanted characters
+        hook_title = hook_title.replace("\r", "").replace("\n", "\\N")
+        hook_title = "".join(c for c in hook_title if 32 <= ord(c) < 127)
+        # Ensure max ~48 characters total
+        if len(hook_title.replace("\\N", " ")) > 48:
+            parts = hook_title.split("\\N")
+            if len(parts) >= 2:
+                hook_title = f"{parts[0][:24]}\\N{parts[1][:24]}"
+            else:
+                hook_title = hook_title[:48]
 
         yt_title = data.get("yt_title", "").strip()
         if not yt_title.endswith("#Shorts"):
-            yt_title = f"{yt_title[:75]} #Shorts"
+            yt_title = f"{yt_title[:67]} #Shorts"
+        else:
+            if len(yt_title) > 75:
+                yt_title = f"{yt_title[:67]} #Shorts"
 
         ig_caption = data.get("ig_caption", "").strip()
 
