@@ -105,7 +105,9 @@ def detect_streamer_cam(video_path):
     Run mediapipe face detection.
     Filter for faces on sides (center_x < 0.35 * width or center_x > 0.65 * width).
     If >= 3 frames detect side face, compute median (face_cx, face_cy)
-    and return vertical 9:16 crop box (crop_x, crop_y, crop_w, crop_h).
+    and return crop box (crop_x, crop_y, crop_w, crop_h) with 1080:680 (~1.59:1)
+    aspect ratio centered around streamer's median face coordinates (padded to show
+    head, shoulders, headset, clamped inside frame bounds).
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -120,7 +122,7 @@ def detect_streamer_cam(video_path):
         return None
 
     frame_indices = np.linspace(0, total_frames - 1, num=12, dtype=int)
-    side_face_centers = []
+    side_faces = []
 
     mp_face_detection = mp.solutions.face_detection
     with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as detector:
@@ -138,39 +140,57 @@ def detect_streamer_cam(video_path):
                     bbox = detection.location_data.relative_bounding_box
                     cx = (bbox.xmin + bbox.width / 2.0) * width
                     cy = (bbox.ymin + bbox.height / 2.0) * height
+                    bw = bbox.width * width
+                    bh = bbox.height * height
 
                     # Side face condition
                     if cx < 0.35 * width or cx > 0.65 * width:
-                        side_face_centers.append((cx, cy))
+                        side_faces.append((cx, cy, bw, bh))
                         break
 
     cap.release()
 
-    if len(side_face_centers) < 3:
-        print(f"Streamer cam detection: Only {len(side_face_centers)}/12 side faces detected. No webcam box.")
+    if len(side_faces) < 3:
+        print(f"Streamer cam detection: Only {len(side_faces)}/12 side faces detected. No webcam box.")
         return None
 
-    med_cx = float(np.median([c[0] for c in side_face_centers]))
-    med_cy = float(np.median([c[1] for c in side_face_centers]))
-    print(f"Streamer cam detected! Detected {len(side_face_centers)} side faces. Median center: ({med_cx:.1f}, {med_cy:.1f})")
+    med_cx = float(np.median([f[0] for f in side_faces]))
+    med_cy = float(np.median([f[1] for f in side_faces]))
+    med_bw = float(np.median([f[2] for f in side_faces]))
+    med_bh = float(np.median([f[3] for f in side_faces]))
+    print(f"Streamer cam detected! Detected {len(side_faces)} side faces. Median center: ({med_cx:.1f}, {med_cy:.1f}), size: ({med_bw:.1f}, {med_bh:.1f})")
 
-    # 9:16 crop box
-    target_aspect = 9.0 / 16.0
-    crop_h = height
+    # Target aspect ratio: 1080 / 680 (~1.5882)
+    target_aspect = 1080.0 / 680.0
+
+    # Generously pad around face to include head, headset, and shoulders (e.g. 3.2x face height)
+    crop_h = int(med_bh * 3.2)
     crop_w = int(crop_h * target_aspect)
+
+    # Make sure crop_h and crop_w are within bounds, but also sufficiently large
+    min_h = int(height * 0.35)
+    if crop_h < min_h:
+        crop_h = min_h
+        crop_w = int(crop_h * target_aspect)
 
     if crop_w > width:
         crop_w = width
         crop_h = int(crop_w / target_aspect)
+    if crop_h > height:
+        crop_h = height
+        crop_w = int(crop_h * target_aspect)
+
+    # Shift center slightly down from face center (e.g. +10% face height) to include shoulders
+    target_cy = med_cy + med_bh * 0.15
 
     crop_x = int(med_cx - crop_w / 2.0)
-    crop_y = int(med_cy - crop_h / 2.0)
+    crop_y = int(target_cy - crop_h / 2.0)
 
     # Clamp bounds cleanly
     crop_x = max(0, min(crop_x, width - crop_w))
     crop_y = max(0, min(crop_y, height - crop_h))
 
-    # Ensure even dimensions for video encoding
+    # Ensure even dimensions
     crop_w = crop_w - (crop_w % 2)
     crop_h = crop_h - (crop_h % 2)
     crop_x = crop_x - (crop_x % 2)
@@ -262,15 +282,13 @@ def build_jumpcut_timeline(all_words, original_duration):
     """
     Groups consecutive words into active speech segments whenever silence gap <= 0.85s.
     Pads each active speech segment by 0.15s before start and 0.20s after end.
-    Fills in non-speech gameplay segments between active segments.
     Keeps total kept duration >= 10s. If trimmed < 10s, keeps original untrimmed duration.
     Remaps word timestamps to match jump-cut timeline.
-    Returns: timeline_segments (list of dicts with start, end, is_speech), remapped_words
+    Returns: timeline_segments (list of dicts with start, end), remapped_words, total_duration
     """
     if not all_words:
-        # No speech words detected, single gameplay segment
-        timeline = [{"start": 0.0, "end": original_duration, "is_speech": False}]
-        return timeline, []
+        timeline = [{"start": 0.0, "end": original_duration}]
+        return timeline, [], original_duration
 
     # 1. Group words where gap <= 0.85s
     raw_speech_groups = []
@@ -311,20 +329,11 @@ def build_jumpcut_timeline(all_words, original_duration):
     # 4. If total speech duration is < 10s, keep original untrimmed duration
     if total_kept_speech < 10.0:
         print(f"Total speech duration ({total_kept_speech:.2f}s) < 10s. Keeping original full duration.")
-        # Mark entire clip timeline, tagging active speaking intervals
-        timeline = []
-        curr_t = 0.0
-        for seg in merged_speech_segments:
-            if seg["start"] > curr_t:
-                timeline.append({"start": curr_t, "end": seg["start"], "is_speech": False})
-            timeline.append({"start": seg["start"], "end": seg["end"], "is_speech": True})
-            curr_t = seg["end"]
-        if curr_t < original_duration:
-            timeline.append({"start": curr_t, "end": original_duration, "is_speech": False})
-
-        # No jump cut time shift: words keep original timestamps
-        remapped_words = all_words
-        return timeline, remapped_words
+        timeline = [{"start": 0.0, "end": original_duration}]
+        remapped_words = [
+            {"word": w.word, "start": w.start, "end": w.end} for w in all_words
+        ]
+        return timeline, remapped_words, original_duration
 
     # Build jump-cut timeline (only kept speech segments are retained)
     timeline = []
@@ -334,7 +343,7 @@ def build_jumpcut_timeline(all_words, original_duration):
     for seg in merged_speech_segments:
         seg_start = seg["start"]
         seg_end = seg["end"]
-        timeline.append({"start": seg_start, "end": seg_end, "is_speech": True})
+        timeline.append({"start": seg_start, "end": seg_end})
 
         # Remap words within this segment
         for w in seg["words"]:
@@ -351,22 +360,72 @@ def build_jumpcut_timeline(all_words, original_duration):
         accumulated_time += (seg_end - seg_start)
 
     print(f"Jump-cut silence removal applied: {original_duration:.2f}s -> {accumulated_time:.2f}s")
-    return timeline, remapped_words
+    return timeline, remapped_words, accumulated_time
 
 
-def write_ass_subtitles(remapped_words, ass_path):
-    # MarginV=580 and Fontsize=76 to place subtitles cleanly above YouTube Shorts UI
+def build_hook_text(broadcaster_name, title):
+    # Clean hashtags, links, and non-ASCII chars
+    clean_title = re.sub(r"https?://\S+", "", title)
+    clean_title = re.sub(r"#\S+", "", clean_title)
+    clean_title = "".join(c for c in clean_title if 32 <= ord(c) < 127).strip()
+    clean_title = re.sub(r"\s+", " ", clean_title)
+
+    clean_broadcaster = "".join(c for c in broadcaster_name if 32 <= ord(c) < 127).strip()
+    if clean_broadcaster:
+        full_text = f"{clean_broadcaster.upper()}: {clean_title}"
+    else:
+        full_text = clean_title
+
+    # Wrap to ~26 chars per line, max 2 lines
+    words = full_text.split()
+    line1 = []
+    line2 = []
+    len1 = 0
+    for w in words:
+        w_len = len(w) + (1 if line1 else 0)
+        if len1 + w_len <= 26 and not line2:
+            line1.append(w)
+            len1 += w_len
+        else:
+            if len(" ".join(line2 + [w])) <= 26:
+                line2.append(w)
+            else:
+                if not line2:
+                    line2.append(w[:23] + "...")
+                break
+
+    text_line1 = " ".join(line1)
+    text_line2 = " ".join(line2)
+
+    if text_line2:
+        return f"{text_line1}\\N{text_line2}"
+    return text_line1
+
+
+def write_ass_subtitles(remapped_words, ass_path, total_duration, hook_text, has_webcam=True):
     header = (
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n"
         "[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,"
         "Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,"
         "Alignment,MarginL,MarginR,MarginV,Encoding\n"
-        "Style: Default,Arial,76,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,40,40,580,1\n\n"
+        "Style: Hook,Arial,62,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,5,2,5,50,50,0,1\n"
+        "Style: Default,Arial,68,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,45,45,420,1\n\n"
         "[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"
     )
     lines = []
+
+    # Hook banner across seam (y=680 if webcam split, or top area if fallback)
+    seam_y = 680 if has_webcam else 300
+    end_time_str = format_ass_time(total_duration)
+    lines.append(f"Dialogue: 1,0:00:00.00,{end_time_str},Hook,,0,0,0,,{{\\pos(540,{seam_y})}}{hook_text}")
+
+    # Spoken subtitles
     for w in remapped_words:
         w_text = w["word"].strip().upper() if isinstance(w, dict) else w.word.strip().upper()
+        # Filter non-ASCII characters for clean rendering
+        w_text = "".join(c for c in w_text if 32 <= ord(c) < 127)
+        if not w_text:
+            continue
         w_start = w["start"] if isinstance(w, dict) else w.start
         w_end = w["end"] if isinstance(w, dict) else w.end
         lines.append(f"Dialogue: 0,{format_ass_time(w_start)},{format_ass_time(w_end)},Default,,0,0,0,,{w_text}")
@@ -374,14 +433,18 @@ def write_ass_subtitles(remapped_words, ass_path):
     Path(ass_path).write_text(header + "\n".join(lines), encoding="utf-8")
 
 
-def render_dynamic_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box):
+def render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box):
     """
-    Renders segments dynamically:
-    - If cam_box and is_speech: cropped to streamer's webcam box (1080x1920)
-    - Otherwise (gameplay): center crop (1080x1920)
-    Concatenates segments and burns in subtitles.
+    1. Concatenate jump-cut segments into joined.mp4.
+    2. Render split-screen 1080x1920:
+       - If cam_box:
+         [0:v]crop=cw:ch:cx:cy,scale=1080:680[top];
+         [0:v]scale=1080:1240:force_original_aspect_ratio=increase,crop=1080:1240[bottom];
+         [top][bottom]vstack=inputs=2,ass=ass_path[outv]
+       - If no cam_box (fallback):
+         [0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,ass=ass_path[outv]
     """
-    temp_dir = tempfile.mkdtemp(prefix="render_dynamic_")
+    temp_dir = tempfile.mkdtemp(prefix="render_split_")
     try:
         segment_files = []
         for i, seg in enumerate(timeline_segments):
@@ -391,20 +454,12 @@ def render_dynamic_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_b
                 continue
 
             seg_file = os.path.join(temp_dir, f"seg_{i:03d}.mp4")
-
-            if cam_box and seg["is_speech"]:
-                cx, cy, cw, ch = cam_box
-                vf = f"crop={cw}:{ch}:{cx}:{cy},scale=1080:1920"
-            else:
-                vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
-
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", f"{seg_start:.3f}",
                 "-i", str(raw_mp4),
                 "-t", f"{seg_dur:.3f}",
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                 "-c:a", "aac", "-b:a", "128k",
                 "-avoid_negative_ts", "make_zero",
                 seg_file
@@ -413,36 +468,52 @@ def render_dynamic_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_b
             segment_files.append(seg_file)
 
         if not segment_files:
-            raise RuntimeError("No valid segments rendered.")
+            raise RuntimeError("No valid segments rendered during jump-cut.")
 
-        concat_list = os.path.join(temp_dir, "concat.txt")
-        with open(concat_list, "w", encoding="utf-8") as f:
-            for s in segment_files:
-                f.write(f"file '{Path(s).as_posix()}'\n")
+        joined_mp4 = os.path.join(temp_dir, "joined.mp4")
+        if len(segment_files) == 1:
+            joined_mp4 = segment_files[0]
+        else:
+            concat_list = os.path.join(temp_dir, "concat.txt")
+            with open(concat_list, "w", encoding="utf-8") as f:
+                for s in segment_files:
+                    f.write(f"file '{Path(s).as_posix()}'\n")
 
-        # Concatenate and burn ASS subtitles
-        concat_mp4 = os.path.join(temp_dir, "concat.mp4")
-        concat_cmd = [
-            "ffmpeg", "-y",
-            "-f", "concat", "-safe", "0",
-            "-i", concat_list,
-            "-c", "copy",
-            concat_mp4
-        ]
-        subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            concat_cmd = [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", concat_list,
+                "-c", "copy",
+                joined_mp4
+            ]
+            subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-        # Burn subtitles
         escaped_ass = Path(ass_path).as_posix().replace(":", r"\:")
-        burn_cmd = [
+
+        if cam_box:
+            cx, cy, cw, ch = cam_box
+            filtergraph = (
+                f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:680[top];"
+                f"[0:v]scale=1080:1240:force_original_aspect_ratio=increase,crop=1080:1240[bottom];"
+                f"[top][bottom]vstack=inputs=2,ass={escaped_ass}[outv]"
+            )
+        else:
+            filtergraph = (
+                f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,ass={escaped_ass}[outv]"
+            )
+
+        final_cmd = [
             "ffmpeg", "-y",
-            "-i", concat_mp4,
-            "-vf", f"ass={escaped_ass}",
+            "-i", joined_mp4,
+            "-filter_complex", filtergraph,
+            "-map", "[outv]",
+            "-map", "0:a?",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "copy",
+            "-c:a", "aac", "-b:a", "128k",
             "-movflags", "+faststart",
             str(out_mp4)
         ]
-        subprocess.run(burn_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(final_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -477,7 +548,8 @@ def upload_youtube(video_path, title):
 def process_and_upload_candidate(clip):
     clip_id = clip["id"]
     title = clip.get("title", "")
-    print(f"\nEvaluating candidate clip ({clip.get('view_count', 0)} views): {clip_id} - '{title}'")
+    broadcaster = clip.get("broadcaster_name", "")
+    print(f"\nEvaluating candidate clip ({clip.get('view_count', 0)} views): {clip_id} - '{title}' by {broadcaster}")
 
     raw_mp4 = Path(f"{clip_id}_raw.mp4")
     ass_path = Path(f"{clip_id}.ass")
@@ -499,18 +571,19 @@ def process_and_upload_candidate(clip):
             mark_processed(clip_id)
             return False
 
-        # 3. Detect streamer webcam position
+        # 3. Detect streamer webcam position (1080:680 box)
         cam_box = detect_streamer_cam(raw_mp4)
 
         # 4. Jump-cut silence removal & timeline remapping
         orig_dur = get_video_duration(raw_mp4)
-        timeline_segments, remapped_words = build_jumpcut_timeline(words, orig_dur)
+        timeline_segments, remapped_words, total_dur = build_jumpcut_timeline(words, orig_dur)
 
-        # 5. Generate high subtitles (MarginV=580, Fontsize=76)
-        write_ass_subtitles(remapped_words, ass_path)
+        # 5. Build hook banner text and write ASS subtitles (Hook style at y=680, Default style at MarginV=420)
+        hook_text = build_hook_text(broadcaster, title)
+        write_ass_subtitles(remapped_words, ass_path, total_dur, hook_text, has_webcam=(cam_box is not None))
 
-        # 6. Render dynamic vertical video with speaker-to-gameplay switching
-        render_dynamic_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box)
+        # 6. Render stacked split-screen vertical video (top 1080x680 webcam, bottom 1080x1240 gameplay)
+        render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box)
 
         # 7. Upload to YouTube
         upload_youtube(out_mp4, title)
