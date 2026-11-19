@@ -16,8 +16,8 @@ from nudenet import NudeDetector
 
 PROCESSED_FILE = Path("processed.txt")
 PROCESSED = set(PROCESSED_FILE.read_text().splitlines()) if PROCESSED_FILE.exists() else set()
-MAX_UPLOADS_PER_DAY = 6  # Matches YouTube's 10,000 daily API quota (1,600 units/upload)
-FALLBACK_HOURS = [24, 48, 72, 168, 720]  # 24h -> 48h -> 3 days -> 7 days -> 30 days
+MAX_DAILY_UPLOADS = 1  # Exactly 1 top viral clip uploaded per UTC day
+FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Starts with 24 hours (today's viral clips)
 
 BLOCKED_KEYWORDS = [
     "strip", "stripclub", "club", "nsfw", "nude", "nudity", "naked",
@@ -206,7 +206,7 @@ def reached_daily_limit():
         content = count_file.read_text().strip()
         if ":" in content:
             saved_date, count = content.split(":")
-            if saved_date == today_str and int(count) >= MAX_UPLOADS_PER_DAY:
+            if saved_date == today_str and int(count) >= MAX_DAILY_UPLOADS:
                 return True
     return False
 
@@ -634,7 +634,7 @@ def process_and_upload_candidate(clip):
 
 def main():
     if reached_daily_limit():
-        print("Reached 6 uploads today (YouTube API daily quota limit). Skipping until tomorrow.")
+        print(f"Reached daily limit of {MAX_DAILY_UPLOADS} upload(s) for today (UTC). Skipping until tomorrow.")
         return
 
     token = get_twitch_token()
