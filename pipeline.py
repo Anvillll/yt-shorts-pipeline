@@ -4,7 +4,6 @@ import shutil
 import subprocess
 import tempfile
 import cv2
-import mediapipe as mp
 import numpy as np
 import requests
 from datetime import datetime, timedelta, timezone
@@ -102,9 +101,9 @@ def get_video_duration(video_path):
 def detect_streamer_cam(video_path):
     """
     Sample 12 evenly spaced frames using OpenCV.
-    Run mediapipe face detection.
-    Filter for faces on sides (center_x < 0.35 * width or center_x > 0.65 * width).
-    If >= 3 frames detect side face, compute median (face_cx, face_cy)
+    Detect faces using OpenCV built-in Haar Cascade classifier.
+    Filter for faces on sides (face_cx < 0.35 * width or face_cx > 0.65 * width).
+    If >= 3 frames detect side face, compute median (face_cx, face_cy, face_w, face_h)
     and return crop box (crop_x, crop_y, crop_w, crop_h) with 1080:680 (~1.59:1)
     aspect ratio centered around streamer's median face coordinates (padded to show
     head, shoulders, headset, clamped inside frame bounds).
@@ -121,32 +120,33 @@ def detect_streamer_cam(video_path):
         cap.release()
         return None
 
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+    if face_cascade.empty():
+        print(f"Warning: Could not load Haar cascade from {cascade_path}")
+        cap.release()
+        return None
+
     frame_indices = np.linspace(0, total_frames - 1, num=12, dtype=int)
     side_faces = []
 
-    mp_face_detection = mp.solutions.face_detection
-    with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as detector:
-        for idx in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                continue
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            continue
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = detector.process(rgb_frame)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detected = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
 
-            if results.detections:
-                for detection in results.detections:
-                    bbox = detection.location_data.relative_bounding_box
-                    cx = (bbox.xmin + bbox.width / 2.0) * width
-                    cy = (bbox.ymin + bbox.height / 2.0) * height
-                    bw = bbox.width * width
-                    bh = bbox.height * height
-
-                    # Side face condition
-                    if cx < 0.35 * width or cx > 0.65 * width:
-                        side_faces.append((cx, cy, bw, bh))
-                        break
+        if len(detected) > 0:
+            for (x, y, w, h) in detected:
+                cx = x + w / 2.0
+                cy = y + h / 2.0
+                # Side face condition
+                if cx < 0.35 * width or cx > 0.65 * width:
+                    side_faces.append((cx, cy, float(w), float(h)))
+                    break
 
     cap.release()
 
@@ -180,7 +180,7 @@ def detect_streamer_cam(video_path):
         crop_h = height
         crop_w = int(crop_h * target_aspect)
 
-    # Shift center slightly down from face center (e.g. +10% face height) to include shoulders
+    # Shift center slightly down from face center to include shoulders
     target_cy = med_cy + med_bh * 0.15
 
     crop_x = int(med_cx - crop_w / 2.0)
@@ -283,12 +283,16 @@ def build_jumpcut_timeline(all_words, original_duration):
     Groups consecutive words into active speech segments whenever silence gap <= 0.85s.
     Pads each active speech segment by 0.15s before start and 0.20s after end.
     Keeps total kept duration >= 10s. If trimmed < 10s, keeps original untrimmed duration.
+    Ensures total kept duration is capped at 58.5s so video strictly qualifies as a Short.
     Remaps word timestamps to match jump-cut timeline.
     Returns: timeline_segments (list of dicts with start, end), remapped_words, total_duration
     """
+    MAX_SHORT_DURATION = 58.5
+
     if not all_words:
-        timeline = [{"start": 0.0, "end": original_duration}]
-        return timeline, [], original_duration
+        dur = min(original_duration, MAX_SHORT_DURATION)
+        timeline = [{"start": 0.0, "end": dur}]
+        return timeline, [], dur
 
     # 1. Group words where gap <= 0.85s
     raw_speech_groups = []
@@ -326,16 +330,20 @@ def build_jumpcut_timeline(all_words, original_duration):
 
     total_kept_speech = sum(s["end"] - s["start"] for s in merged_speech_segments)
 
-    # 4. If total speech duration is < 10s, keep original untrimmed duration
+    # 4. If total speech duration is < 10s, keep original untrimmed duration (capped at 58.5s)
     if total_kept_speech < 10.0:
-        print(f"Total speech duration ({total_kept_speech:.2f}s) < 10s. Keeping original full duration.")
-        timeline = [{"start": 0.0, "end": original_duration}]
+        dur = min(original_duration, MAX_SHORT_DURATION)
+        print(f"Total speech duration ({total_kept_speech:.2f}s) < 10s. Keeping original duration capped at {dur:.2f}s.")
+        timeline = [{"start": 0.0, "end": dur}]
         remapped_words = [
-            {"word": w.word, "start": w.start, "end": w.end} for w in all_words
+            {"word": w.word, "start": w.start, "end": min(w.end, dur)}
+            for w in all_words
+            if w.start < dur
         ]
-        return timeline, remapped_words, original_duration
+        return timeline, remapped_words, dur
 
     # Build jump-cut timeline (only kept speech segments are retained)
+    # Cap total accumulated duration at MAX_SHORT_DURATION (58.5s)
     timeline = []
     remapped_words = []
     accumulated_time = 0.0
@@ -343,23 +351,44 @@ def build_jumpcut_timeline(all_words, original_duration):
     for seg in merged_speech_segments:
         seg_start = seg["start"]
         seg_end = seg["end"]
-        timeline.append({"start": seg_start, "end": seg_end})
+        seg_dur = seg_end - seg_start
 
-        # Remap words within this segment
-        for w in seg["words"]:
-            word_offset_start = w.start - seg_start
-            word_offset_end = w.end - seg_start
-            new_w_start = accumulated_time + word_offset_start
-            new_w_end = accumulated_time + word_offset_end
-            remapped_words.append({
-                "word": w.word,
-                "start": new_w_start,
-                "end": new_w_end
-            })
+        if accumulated_time + seg_dur > MAX_SHORT_DURATION:
+            allowed_dur = MAX_SHORT_DURATION - accumulated_time
+            if allowed_dur > 0.1:
+                seg_end = seg_start + allowed_dur
+                timeline.append({"start": seg_start, "end": seg_end})
 
-        accumulated_time += (seg_end - seg_start)
+                for w in seg["words"]:
+                    if w.start < seg_end:
+                        word_offset_start = w.start - seg_start
+                        word_offset_end = min(w.end, seg_end) - seg_start
+                        new_w_start = accumulated_time + word_offset_start
+                        new_w_end = accumulated_time + word_offset_end
+                        remapped_words.append({
+                            "word": w.word,
+                            "start": new_w_start,
+                            "end": new_w_end
+                        })
+                accumulated_time += allowed_dur
+            break
+        else:
+            timeline.append({"start": seg_start, "end": seg_end})
 
-    print(f"Jump-cut silence removal applied: {original_duration:.2f}s -> {accumulated_time:.2f}s")
+            for w in seg["words"]:
+                word_offset_start = w.start - seg_start
+                word_offset_end = w.end - seg_start
+                new_w_start = accumulated_time + word_offset_start
+                new_w_end = accumulated_time + word_offset_end
+                remapped_words.append({
+                    "word": w.word,
+                    "start": new_w_start,
+                    "end": new_w_end
+                })
+
+            accumulated_time += seg_dur
+
+    print(f"Jump-cut silence removal applied: {original_duration:.2f}s -> {accumulated_time:.2f}s (capped at {MAX_SHORT_DURATION}s)")
     return timeline, remapped_words, accumulated_time
 
 
