@@ -15,6 +15,7 @@ from nudenet import NudeDetector
 PROCESSED_FILE = Path("processed.txt")
 PROCESSED = set(PROCESSED_FILE.read_text().splitlines()) if PROCESSED_FILE.exists() else set()
 MAX_UPLOADS_PER_DAY = 6  # Matches YouTube's 10,000 daily API quota (1,600 units/upload)
+FALLBACK_HOURS = [24, 48, 72, 168, 720]  # 24h -> 48h -> 3 days -> 7 days -> 30 days
 
 BLOCKED_KEYWORDS = [
     "strip", "stripclub", "club", "nsfw", "nude", "nudity", "naked",
@@ -49,7 +50,6 @@ def has_blocked_keywords(title):
     for word in BLOCKED_KEYWORDS:
         if re.search(rf"\b{re.escape(word)}\b", t_lower):
             return True
-        # For numeric/special tokens like 18+ or general occurrence
         if word in ["18+", "xxx"] and word in t_lower:
             return True
     return False
@@ -58,7 +58,6 @@ def has_blocked_keywords(title):
 def contains_nsfw(video_path):
     temp_dir = tempfile.mkdtemp(prefix="nude_check_")
     try:
-        # Extract 1 frame per second as JPEG
         frame_pattern = os.path.join(temp_dir, "frame_%04d.jpg")
         cmd = [
             "ffmpeg", "-y", "-i", str(video_path),
@@ -130,9 +129,9 @@ def get_gta6_game_id(token):
     return data[0]["id"] if data else None
 
 
-def fetch_todays_top_clip(token, game_id):
+def fetch_clips_for_window(token, game_id, hours):
     headers = {"Client-ID": os.environ["TWITCH_CLIENT_ID"], "Authorization": f"Bearer {token}"}
-    started_at = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    started_at = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
     r = requests.get("https://api.twitch.tv/helix/clips", headers=headers, params={
         "game_id": game_id,
         "started_at": started_at,
@@ -140,34 +139,7 @@ def fetch_todays_top_clip(token, game_id):
     }, timeout=15)
     r.raise_for_status()
     clips = sorted(r.json().get("data", []), key=lambda c: c.get("view_count", 0), reverse=True)
-
-    for clip in clips:
-        clip_id = clip["id"]
-        if clip_id in PROCESSED:
-            continue
-
-        title = clip.get("title", "")
-        # Strict English check on metadata & title
-        if clip.get("language") != "en":
-            print(f"Skipping clip {clip_id}: language is '{clip.get('language')}', not 'en'.")
-            mark_processed(clip_id)
-            continue
-
-        if not is_ascii_english_title(title):
-            print(f"Skipping clip {clip_id}: title failed ASCII English check ('{title}').")
-            mark_processed(clip_id)
-            continue
-
-        # Nudity & adult-content keyword blocklist
-        if has_blocked_keywords(title):
-            print(f"Skipping clip {clip_id}: title contains blocked adult keyword ('{title}').")
-            mark_processed(clip_id)
-            continue
-
-        if 10 <= clip.get("duration", 0) <= 60:
-            return clip
-
-    return None
+    return clips
 
 
 def format_ass_time(sec):
@@ -236,6 +208,49 @@ def upload_youtube(video_path, title):
     print("Uploaded YouTube Video ID:", resp["id"])
 
 
+def process_and_upload_candidate(clip):
+    clip_id = clip["id"]
+    title = clip.get("title", "")
+    print(f"\nEvaluating candidate clip ({clip.get('view_count', 0)} views): {clip_id} - '{title}'")
+
+    raw_mp4 = Path(f"{clip_id}_raw.mp4")
+    ass_path = Path(f"{clip_id}.ass")
+    out_mp4 = Path(f"{clip_id}_short.mp4")
+
+    try:
+        subprocess.run(["yt-dlp", "-f", "mp4", "-o", str(raw_mp4), clip["url"]], check=True)
+
+        # Strict Nudity & Adult-Content Guard
+        if contains_nsfw(raw_mp4):
+            print(f"WARNING: Clip {clip_id} flagged for NSFW/nudity content! Skipping.")
+            mark_processed(clip_id)
+            return False
+
+        # Audio transcription & English check
+        english_audio = generate_ass(raw_mp4, ass_path)
+        if not english_audio:
+            print(f"Clip {clip_id} audio was not verified English. Skipping.")
+            mark_processed(clip_id)
+            return False
+
+        render_vertical(raw_mp4, ass_path, out_mp4)
+        upload_youtube(out_mp4, title)
+
+        mark_processed(clip_id)
+        increment_daily_count()
+        return True
+
+    except Exception as e:
+        print(f"Error processing clip {clip_id}: {e}")
+        mark_processed(clip_id)
+        return False
+
+    finally:
+        for p in (raw_mp4, ass_path, out_mp4):
+            if p.exists():
+                p.unlink()
+
+
 def main():
     if reached_daily_limit():
         print("Reached 6 uploads today (YouTube API daily quota limit). Skipping until tomorrow.")
@@ -247,43 +262,54 @@ def main():
         print("Grand Theft Auto VI category not found on Twitch.")
         return
 
-    clip = fetch_todays_top_clip(token, game_id)
-    if not clip:
-        print("No new GTA VI clips found in the last 24 hours.")
-        return
+    # Check clips across progressive time windows
+    uploaded = False
+    for hours in FALLBACK_HOURS:
+        print(f"\n--- Searching Twitch clips in the last {hours} hours window ---")
+        clips = fetch_clips_for_window(token, game_id, hours)
 
-    clip_id = clip["id"]
-    print(f"Processing today's top clip ({clip['view_count']} views): {clip_id} - {clip['title']}")
-    raw_mp4 = Path(f"{clip_id}_raw.mp4")
-    ass_path = Path(f"{clip_id}.ass")
-    out_mp4 = Path(f"{clip_id}_short.mp4")
+        for clip in clips:
+            clip_id = clip["id"]
+            if clip_id in PROCESSED:
+                continue
 
-    try:
-        subprocess.run(["yt-dlp", "-f", "mp4", "-o", str(raw_mp4), clip["url"]], check=True)
+            title = clip.get("title", "")
+            # Strict English check on metadata & title
+            if clip.get("language") != "en":
+                print(f"Skipping clip {clip_id}: language is '{clip.get('language')}', not 'en'.")
+                mark_processed(clip_id)
+                continue
 
-        # Strict Nudity & Adult-Content Guard
-        if contains_nsfw(raw_mp4):
-            print(f"WARNING: Clip {clip_id} flagged for NSFW/nudity content! Aborting without uploading.")
-            mark_processed(clip_id)
-            return
+            if not is_ascii_english_title(title):
+                print(f"Skipping clip {clip_id}: title failed ASCII English check ('{title}').")
+                mark_processed(clip_id)
+                continue
 
-        # Audio transcription & English check
-        english_audio = generate_ass(raw_mp4, ass_path)
-        if not english_audio:
-            print(f"Clip {clip_id} audio was not verified English. Aborting without uploading.")
-            mark_processed(clip_id)
-            return
+            # Nudity & adult-content keyword blocklist
+            if has_blocked_keywords(title):
+                print(f"Skipping clip {clip_id}: title contains blocked adult keyword ('{title}').")
+                mark_processed(clip_id)
+                continue
 
-        render_vertical(raw_mp4, ass_path, out_mp4)
-        upload_youtube(out_mp4, clip["title"])
+            duration = clip.get("duration", 0)
+            if not (10 <= duration <= 60):
+                print(f"Skipping clip {clip_id}: duration {duration}s not between 10-60s.")
+                mark_processed(clip_id)
+                continue
 
-        mark_processed(clip_id)
-        increment_daily_count()
+            # Attempt full download, NSFW check, Whisper check, render, and upload
+            if process_and_upload_candidate(clip):
+                uploaded = True
+                print(f"Successfully processed and uploaded clip {clip_id} from {hours}h window!")
+                break
 
-    finally:
-        for p in (raw_mp4, ass_path, out_mp4):
-            if p.exists():
-                p.unlink()
+        if uploaded:
+            break
+
+        print(f"No clean, valid clips found in {hours}h window. Expanding search window...")
+
+    if not uploaded:
+        print("No valid GTA VI clips found across all progressive fallback windows.")
 
 
 if __name__ == "__main__":
