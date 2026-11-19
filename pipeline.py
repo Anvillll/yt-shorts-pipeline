@@ -1,8 +1,10 @@
+import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import cv2
 import numpy as np
 import requests
@@ -14,10 +16,18 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from nudenet import NudeDetector
 
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+
 PROCESSED_FILE = Path("processed.txt")
 PROCESSED = set(PROCESSED_FILE.read_text().splitlines()) if PROCESSED_FILE.exists() else set()
-MAX_DAILY_UPLOADS = 1  # Exactly 1 top viral clip uploaded per UTC day
-FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Starts with 24 hours (today's viral clips)
+
+MAX_YT_PER_DAY = 1  # 1 YouTube Short per UTC day
+MAX_IG_PER_DAY = 3  # Up to 3 Instagram Reels per UTC day (Morning, Noon, Night)
+FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Progressive fallback windows
 
 BLOCKED_KEYWORDS = [
     "strip", "stripclub", "club", "nsfw", "nude", "nudity", "naked",
@@ -143,7 +153,6 @@ def detect_streamer_cam(video_path):
             for (x, y, w, h) in detected:
                 cx = x + w / 2.0
                 cy = y + h / 2.0
-                # Side face condition
                 if cx < 0.35 * width or cx > 0.65 * width:
                     side_faces.append((cx, cy, float(w), float(h)))
                     break
@@ -160,14 +169,10 @@ def detect_streamer_cam(video_path):
     med_bh = float(np.median([f[3] for f in side_faces]))
     print(f"Streamer cam detected! Detected {len(side_faces)} side faces. Median center: ({med_cx:.1f}, {med_cy:.1f}), size: ({med_bw:.1f}, {med_bh:.1f})")
 
-    # Target aspect ratio: 1080 / 680 (~1.5882)
     target_aspect = 1080.0 / 680.0
-
-    # Generously pad around face to include head, headset, and shoulders (e.g. 3.2x face height)
     crop_h = int(med_bh * 3.2)
     crop_w = int(crop_h * target_aspect)
 
-    # Make sure crop_h and crop_w are within bounds, but also sufficiently large
     min_h = int(height * 0.35)
     if crop_h < min_h:
         crop_h = min_h
@@ -180,17 +185,13 @@ def detect_streamer_cam(video_path):
         crop_h = height
         crop_w = int(crop_h * target_aspect)
 
-    # Shift center slightly down from face center to include shoulders
     target_cy = med_cy + med_bh * 0.15
-
     crop_x = int(med_cx - crop_w / 2.0)
     crop_y = int(target_cy - crop_h / 2.0)
 
-    # Clamp bounds cleanly
     crop_x = max(0, min(crop_x, width - crop_w))
     crop_y = max(0, min(crop_y, height - crop_h))
 
-    # Ensure even dimensions
     crop_w = crop_w - (crop_w % 2)
     crop_h = crop_h - (crop_h % 2)
     crop_x = crop_x - (crop_x % 2)
@@ -199,29 +200,67 @@ def detect_streamer_cam(video_path):
     return (crop_x, crop_y, crop_w, crop_h)
 
 
-def reached_daily_limit():
+def get_daily_counts():
+    """
+    Reads daily_count.txt supporting both:
+    - 'YYYY-MM-DD:yt=X,ig=Y'
+    - 'YYYY-MM-DD:X' (legacy format treated as yt=X, ig=0)
+    Returns (yt_count, ig_count) for today's UTC date.
+    """
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     count_file = Path("daily_count.txt")
-    if count_file.exists():
-        content = count_file.read_text().strip()
-        if ":" in content:
-            saved_date, count = content.split(":")
-            if saved_date == today_str and int(count) >= MAX_DAILY_UPLOADS:
-                return True
-    return False
+    if not count_file.exists():
+        return 0, 0
+
+    content = count_file.read_text().strip()
+    if ":" not in content:
+        return 0, 0
+
+    saved_date, counts_part = content.split(":", 1)
+    if saved_date != today_str:
+        return 0, 0
+
+    yt_count = 0
+    ig_count = 0
+
+    if "yt=" in counts_part or "ig=" in counts_part:
+        for item in counts_part.split(","):
+            item = item.strip()
+            if item.startswith("yt="):
+                try:
+                    yt_count = int(item.split("=")[1])
+                except ValueError:
+                    pass
+            elif item.startswith("ig="):
+                try:
+                    ig_count = int(item.split("=")[1])
+                except ValueError:
+                    pass
+    else:
+        # Legacy single integer format
+        try:
+            yt_count = int(counts_part.strip())
+        except ValueError:
+            pass
+
+    return yt_count, ig_count
 
 
-def increment_daily_count():
+def increment_daily_count(platform):
+    """
+    Increments 'yt' or 'ig' counter for today's UTC date.
+    """
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    yt_count, ig_count = get_daily_counts()
+
+    if platform == "yt":
+        yt_count += 1
+    elif platform == "ig":
+        ig_count += 1
+
     count_file = Path("daily_count.txt")
-    count = 0
-    if count_file.exists():
-        content = count_file.read_text().strip()
-        if ":" in content:
-            saved_date, saved_count = content.split(":")
-            if saved_date == today_str:
-                count = int(saved_count)
-    count_file.write_text(f"{today_str}:{count + 1}", encoding="utf-8")
+    count_file.write_text(f"{today_str}:yt={yt_count},ig={ig_count}", encoding="utf-8")
+    print(f"Updated daily count for {today_str}: yt={yt_count}, ig={ig_count}")
 
 
 def get_twitch_token():
@@ -268,14 +307,17 @@ def transcribe_and_verify(video_path):
 
     if info.language != "en" or info.language_probability < 0.75:
         print(f"Whisper rejected audio: detected language='{info.language}' with prob={info.language_probability:.2f}")
-        return None, None
+        return None, None, None
 
     all_words = []
+    full_transcript_parts = []
     for seg in segments:
+        full_transcript_parts.append(seg.text)
         for w in seg.words or []:
             all_words.append(w)
 
-    return all_words, info
+    transcript = " ".join(full_transcript_parts).strip()
+    return all_words, info, transcript
 
 
 def build_jumpcut_timeline(all_words, original_duration):
@@ -283,7 +325,7 @@ def build_jumpcut_timeline(all_words, original_duration):
     Groups consecutive words into active speech segments whenever silence gap <= 0.85s.
     Pads each active speech segment by 0.15s before start and 0.20s after end.
     Keeps total kept duration >= 10s. If trimmed < 10s, keeps original untrimmed duration.
-    Ensures total kept duration is capped at 58.5s so video strictly qualifies as a Short.
+    Ensures total kept duration is capped at 58.5s so video strictly qualifies as a Short/Reel.
     Remaps word timestamps to match jump-cut timeline.
     Returns: timeline_segments (list of dicts with start, end), remapped_words, total_duration
     """
@@ -343,7 +385,6 @@ def build_jumpcut_timeline(all_words, original_duration):
         return timeline, remapped_words, dur
 
     # Build jump-cut timeline (only kept speech segments are retained)
-    # Cap total accumulated duration at MAX_SHORT_DURATION (58.5s)
     timeline = []
     remapped_words = []
     accumulated_time = 0.0
@@ -392,23 +433,19 @@ def build_jumpcut_timeline(all_words, original_duration):
     return timeline, remapped_words, accumulated_time
 
 
-def build_hook_text(broadcaster_name, title):
-    # Clean hashtags, links, and non-ASCII chars
-    clean_title = re.sub(r"https?://\S+", "", title)
+def fallback_metadata(broadcaster, raw_title):
+    clean_title = re.sub(r"https?://\S+", "", raw_title)
     clean_title = re.sub(r"#\S+", "", clean_title)
     clean_title = "".join(c for c in clean_title if 32 <= ord(c) < 127).strip()
     clean_title = re.sub(r"\s+", " ", clean_title)
 
-    clean_broadcaster = "".join(c for c in broadcaster_name if 32 <= ord(c) < 127).strip()
-    if clean_broadcaster:
-        full_text = f"{clean_broadcaster.upper()}: {clean_title}"
-    else:
-        full_text = clean_title
+    clean_broadcaster = "".join(c for c in broadcaster if 32 <= ord(c) < 127).strip()
+    prefix = f"{clean_broadcaster.upper()}: " if clean_broadcaster else ""
+    full_text = f"{prefix}{clean_title}"
 
     # Wrap to ~26 chars per line, max 2 lines
     words = full_text.split()
-    line1 = []
-    line2 = []
+    line1, line2 = [], []
     len1 = 0
     for w in words:
         w_len = len(w) + (1 if line1 else 0)
@@ -423,12 +460,88 @@ def build_hook_text(broadcaster_name, title):
                     line2.append(w[:23] + "...")
                 break
 
-    text_line1 = " ".join(line1)
-    text_line2 = " ".join(line2)
+    l1 = " ".join(line1)
+    l2 = " ".join(line2)
+    hook = f"{l1}\\N{l2}" if l2 else l1
 
-    if text_line2:
-        return f"{text_line1}\\N{text_line2}"
-    return text_line1
+    yt_title = f"{full_text[:75]} #Shorts"
+    ig_caption = (
+        f"{full_text}\n\n"
+        f"GTA 6 action from {broadcaster}!\n\n"
+        "#GTAVI #GTA6 #Gaming #TwitchClips #GamingClips #RockstarGames "
+        "#Shorts #Reels #ViralGaming #Gamer #GrandTheftAuto #Gameplay"
+    )
+
+    return {
+        "hook_title": hook,
+        "yt_title": yt_title,
+        "ig_caption": ig_caption
+    }
+
+
+def generate_ai_metadata(broadcaster, raw_title, transcript):
+    """
+    Calls Google AI Studio Gemini API (gemini-2.5-flash via google-genai SDK)
+    to generate viral hook_title, yt_title, and ig_caption.
+    Falls back gracefully if key missing or call fails.
+    """
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key or not genai:
+        print("Gemini API key not found or google-genai not imported. Using fallback metadata.")
+        return fallback_metadata(broadcaster, raw_title)
+
+    prompt = (
+        f"You are a viral social media gaming content specialist creating YouTube Shorts and Instagram Reels "
+        f"for Grand Theft Auto VI (GTA 6).\n\n"
+        f"Streamer: {broadcaster}\n"
+        f"Twitch Clip Title: {raw_title}\n"
+        f"Spoken Audio Transcript: {transcript}\n\n"
+        f"Generate high-engagement viral copy. Return a JSON object with EXACTLY these three fields:\n"
+        f"1. 'hook_title': A curiosity-inducing, punchy 2-line hook formatted with '\\N' as the line break "
+        f"(max 26 characters per line, max 52 characters total, standard ASCII only, no emojis, ALL CAPS preferred, "
+        f"e.g. 'CASEOH COULDN'T BELIEVE\\NWHAT HAPPENED IN GTA 6').\n"
+        f"2. 'yt_title': Highly clickable YouTube Shorts title under 80 characters, ending with '#Shorts'.\n"
+        f"3. 'ig_caption': Engaging Instagram caption summary + 12-15 high-reach GTA 6 gaming hashtags.\n\n"
+        f"Return ONLY raw valid JSON, no markdown formatting."
+    )
+
+    try:
+        client = genai.Client(api_key=gemini_key)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json"
+            )
+        )
+        text = response.text.strip()
+        data = json.loads(text)
+
+        hook_title = data.get("hook_title", "").strip()
+        # Ensure ASCII only and sanitize newlines for ASS subtitle
+        hook_title = "".join(c for c in hook_title if 32 <= ord(c) < 127 or c in ['\n', '\\'])
+        hook_title = hook_title.replace("\n", "\\N")
+
+        yt_title = data.get("yt_title", "").strip()
+        if not yt_title.endswith("#Shorts"):
+            yt_title = f"{yt_title[:75]} #Shorts"
+
+        ig_caption = data.get("ig_caption", "").strip()
+
+        if not hook_title or not yt_title or not ig_caption:
+            raise ValueError("Incomplete metadata fields from Gemini response.")
+
+        print(f"Gemini AI Generated Hook: {hook_title}")
+        print(f"Gemini AI Generated YT Title: {yt_title}")
+        return {
+            "hook_title": hook_title,
+            "yt_title": yt_title,
+            "ig_caption": ig_caption
+        }
+
+    except Exception as e:
+        print(f"Gemini metadata generation failed ({e}). Reverting to fallback.")
+        return fallback_metadata(broadcaster, raw_title)
 
 
 def write_ass_subtitles(remapped_words, ass_path, total_duration, hook_text, has_webcam=True):
@@ -451,7 +564,6 @@ def write_ass_subtitles(remapped_words, ass_path, total_duration, hook_text, has
     # Spoken subtitles
     for w in remapped_words:
         w_text = w["word"].strip().upper() if isinstance(w, dict) else w.word.strip().upper()
-        # Filter non-ASCII characters for clean rendering
         w_text = "".join(c for c in w_text if 32 <= ord(c) < 127)
         if not w_text:
             continue
@@ -559,7 +671,7 @@ def upload_youtube(video_path, title):
     youtube = build("youtube", "v3", credentials=creds)
     body = {
         "snippet": {
-            "title": f"{title[:85]} #Shorts",
+            "title": f"{title[:85]} #Shorts" if not title.endswith("#Shorts") else title[:95],
             "description": f"{title}\n\n#Shorts #Gaming #GTAVI",
             "categoryId": "20",
         },
@@ -574,7 +686,149 @@ def upload_youtube(video_path, title):
     print("Uploaded YouTube Video ID:", resp["id"])
 
 
-def process_and_upload_candidate(clip):
+def upload_instagram_reel(video_path, ig_caption, clip_id):
+    """
+    Uploads video to Instagram Reels using a temporary GitHub Release as the public video host.
+    1. Creates temporary release on Anvillll/yt-shorts-pipeline (tag: temp-reel-{clip_id}-{ts})
+    2. Uploads video asset and retrieves browser_download_url
+    3. Initiates Reels media container on Instagram Graph API
+    4. Polls status until FINISHED (up to 90s)
+    5. Publishes Reel
+    6. Finally block cleans up GitHub release and git tag.
+    """
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    ig_user_id = os.environ.get("IG_USER_ID", "").strip()
+    ig_access_token = os.environ.get("IG_ACCESS_TOKEN", "").strip()
+
+    if not ig_user_id or not ig_access_token:
+        print("Instagram credentials (IG_USER_ID / IG_ACCESS_TOKEN) not set. Skipping Instagram Reel upload.")
+        return False
+
+    if not github_token:
+        print("GITHUB_TOKEN not provided. Cannot host temporary release for Instagram Reel. Skipping.")
+        return False
+
+    repo = os.environ.get("GITHUB_REPOSITORY", "Anvillll/yt-shorts-pipeline")
+    headers_gh = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    tag_name = f"temp-reel-{clip_id}-{int(time.time())}"
+    release_id = None
+    browser_download_url = None
+
+    try:
+        # 1. Create temporary GitHub release
+        print(f"Creating temporary GitHub release: {tag_name}")
+        create_rel_res = requests.post(
+            f"https://api.github.com/repos/{repo}/releases",
+            headers=headers_gh,
+            json={
+                "tag_name": tag_name,
+                "name": f"Temp Reel {clip_id}",
+                "body": "Temporary release for Instagram Reels hosting.",
+                "draft": False,
+                "prerelease": True
+            },
+            timeout=20
+        )
+        create_rel_res.raise_for_status()
+        rel_data = create_rel_res.json()
+        release_id = rel_data["id"]
+        upload_url = rel_data["upload_url"].split("{")[0]
+
+        # 2. Upload video asset to release
+        asset_name = f"{clip_id}_reel.mp4"
+        upload_asset_url = f"{upload_url}?name={asset_name}"
+        headers_upload = {
+            "Authorization": f"Bearer {github_token}",
+            "Content-Type": "video/mp4",
+        }
+        print(f"Uploading video asset to temporary release ({asset_name})...")
+        with open(video_path, "rb") as f:
+            up_res = requests.post(upload_asset_url, headers=headers_upload, data=f, timeout=120)
+        up_res.raise_for_status()
+        browser_download_url = up_res.json().get("browser_download_url")
+        print(f"Temporary asset download URL: {browser_download_url}")
+
+        # 3. Create Reels container via Instagram Graph API
+        print("Creating Instagram Reels media container...")
+        container_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media"
+        c_res = requests.post(
+            container_url,
+            data={
+                "media_type": "REELS",
+                "video_url": browser_download_url,
+                "caption": ig_caption,
+                "access_token": ig_access_token,
+            },
+            timeout=30
+        )
+        c_res.raise_for_status()
+        creation_id = c_res.json().get("id")
+        print(f"Reels container created. Creation ID: {creation_id}")
+
+        # 4. Poll status until FINISHED (up to 90 seconds)
+        status_url = f"https://graph.facebook.com/v21.0/{creation_id}"
+        poll_start = time.time()
+        is_ready = False
+
+        while time.time() - poll_start < 90:
+            time.sleep(5)
+            s_res = requests.get(
+                status_url,
+                params={"fields": "status_code", "access_token": ig_access_token},
+                timeout=15
+            )
+            s_res.raise_for_status()
+            status_code = s_res.json().get("status_code")
+            print(f"Instagram container status: {status_code}")
+
+            if status_code == "FINISHED":
+                is_ready = True
+                break
+            elif status_code == "ERROR":
+                raise RuntimeError(f"Instagram media processing failed: {s_res.text}")
+
+        if not is_ready:
+            raise TimeoutError("Timed out waiting for Instagram Reel container to finish processing.")
+
+        # 5. Publish the Reel
+        print("Publishing Reel to Instagram...")
+        publish_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media_publish"
+        p_res = requests.post(
+            publish_url,
+            data={"creation_id": creation_id, "access_token": ig_access_token},
+            timeout=30
+        )
+        p_res.raise_for_status()
+        published_id = p_res.json().get("id")
+        print(f"Successfully published Instagram Reel! Reel ID: {published_id}")
+        return True
+
+    except Exception as e:
+        print(f"Instagram Reel upload failed: {e}")
+        return False
+
+    finally:
+        # 6. Cleanup temporary release and git tag
+        if release_id:
+            print(f"Deleting temporary release ID {release_id}...")
+            try:
+                requests.delete(f"https://api.github.com/repos/{repo}/releases/{release_id}", headers=headers_gh, timeout=15)
+            except Exception as e:
+                print(f"Failed to delete release {release_id}: {e}")
+
+        print(f"Deleting temporary git tag {tag_name}...")
+        try:
+            requests.delete(f"https://api.github.com/repos/{repo}/git/refs/tags/{tag_name}", headers=headers_gh, timeout=15)
+        except Exception as e:
+            print(f"Failed to delete tag {tag_name}: {e}")
+
+
+def process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
     clip_id = clip["id"]
     title = clip.get("title", "")
     broadcaster = clip.get("broadcaster_name", "")
@@ -594,7 +848,7 @@ def process_and_upload_candidate(clip):
             return False
 
         # 2. Audio transcription & English check
-        words, info = transcribe_and_verify(raw_mp4)
+        words, info, transcript = transcribe_and_verify(raw_mp4)
         if words is None:
             print(f"Clip {clip_id} audio was not verified English. Skipping.")
             mark_processed(clip_id)
@@ -607,19 +861,46 @@ def process_and_upload_candidate(clip):
         orig_dur = get_video_duration(raw_mp4)
         timeline_segments, remapped_words, total_dur = build_jumpcut_timeline(words, orig_dur)
 
-        # 5. Build hook banner text and write ASS subtitles (Hook style at y=680, Default style at MarginV=420)
-        hook_text = build_hook_text(broadcaster, title)
-        write_ass_subtitles(remapped_words, ass_path, total_dur, hook_text, has_webcam=(cam_box is not None))
+        # 5. Gemini AI Metadata Generation (hook_title, yt_title, ig_caption)
+        metadata = generate_ai_metadata(broadcaster, title, transcript)
+        hook_title = metadata["hook_title"]
+        yt_title = metadata["yt_title"]
+        ig_caption = metadata["ig_caption"]
 
-        # 6. Render stacked split-screen vertical video (top 1080x680 webcam, bottom 1080x1240 gameplay)
+        # 6. Build hook banner text and write ASS subtitles (Hook style at y=680, Default style at MarginV=420)
+        write_ass_subtitles(remapped_words, ass_path, total_dur, hook_title, has_webcam=(cam_box is not None))
+
+        # 7. Render stacked split-screen vertical video (top 1080x680 webcam, bottom 1080x1240 gameplay)
         render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box)
 
-        # 7. Upload to YouTube
-        upload_youtube(out_mp4, title)
+        any_upload_succeeded = False
+
+        # 8. Upload to YouTube (if within daily limit)
+        if can_upload_yt:
+            try:
+                print("Uploading to YouTube Shorts...")
+                upload_youtube(out_mp4, yt_title)
+                increment_daily_count("yt")
+                any_upload_succeeded = True
+            except Exception as e:
+                print(f"YouTube upload failed: {e}")
+        else:
+            print("YouTube daily limit reached for today. Skipping YouTube upload.")
+
+        # 9. Upload to Instagram Reels (if within daily limit)
+        if can_upload_ig:
+            try:
+                print("Uploading to Instagram Reels...")
+                if upload_instagram_reel(out_mp4, ig_caption, clip_id):
+                    increment_daily_count("ig")
+                    any_upload_succeeded = True
+            except Exception as e:
+                print(f"Instagram upload failed: {e}")
+        else:
+            print("Instagram daily limit reached for today. Skipping Instagram upload.")
 
         mark_processed(clip_id)
-        increment_daily_count()
-        return True
+        return any_upload_succeeded
 
     except Exception as e:
         print(f"Error processing clip {clip_id}: {e}")
@@ -633,8 +914,14 @@ def process_and_upload_candidate(clip):
 
 
 def main():
-    if reached_daily_limit():
-        print(f"Reached daily limit of {MAX_DAILY_UPLOADS} upload(s) for today (UTC). Skipping until tomorrow.")
+    yt_count, ig_count = get_daily_counts()
+    print(f"Today's current upload count: YouTube={yt_count}/{MAX_YT_PER_DAY}, Instagram={ig_count}/{MAX_IG_PER_DAY}")
+
+    can_upload_yt = yt_count < MAX_YT_PER_DAY
+    can_upload_ig = ig_count < MAX_IG_PER_DAY
+
+    if not can_upload_yt and not can_upload_ig:
+        print(f"All daily upload caps reached for today (YouTube: {yt_count}/{MAX_YT_PER_DAY}, Instagram: {ig_count}/{MAX_IG_PER_DAY}). Exiting cleanly.")
         return
 
     token = get_twitch_token()
@@ -678,10 +965,10 @@ def main():
                 mark_processed(clip_id)
                 continue
 
-            # Attempt full download, NSFW check, Whisper check, render, and upload
-            if process_and_upload_candidate(clip):
+            # Process candidate and upload to eligible platforms
+            if process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
                 uploaded = True
-                print(f"Successfully processed and uploaded clip {clip_id} from {hours}h window!")
+                print(f"Successfully processed and published clip {clip_id} from {hours}h window!")
                 break
 
         if uploaded:
