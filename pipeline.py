@@ -117,87 +117,97 @@ def detect_streamer_cam(video_path):
     and return crop box (crop_x, crop_y, crop_w, crop_h) with 1080:680 (~1.59:1)
     aspect ratio centered around streamer's median face coordinates (padded to show
     head, shoulders, headset, clamped inside frame bounds).
+    Safely catches any OpenCV initialization errors and falls back to None.
     """
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return None
+    try:
+        if not hasattr(cv2, "CascadeClassifier"):
+            print("Warning: cv2.CascadeClassifier is not available. Falling back to full-screen vertical framing.")
+            return None
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return None
 
-    if total_frames <= 0 or width <= 0 or height <= 0:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if total_frames <= 0 or width <= 0 or height <= 0:
+            cap.release()
+            return None
+
+        cascade_path = getattr(getattr(cv2, "data", None), "haarcascades", "") + "haarcascade_frontalface_default.xml"
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        if face_cascade.empty():
+            print(f"Warning: Could not load Haar cascade from {cascade_path}. Falling back to full-screen.")
+            cap.release()
+            return None
+
+        frame_indices = np.linspace(0, total_frames - 1, num=12, dtype=int)
+        side_faces = []
+
+        for idx in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            detected = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+
+            if len(detected) > 0:
+                for (x, y, w, h) in detected:
+                    cx = x + w / 2.0
+                    cy = y + h / 2.0
+                    if cx < 0.35 * width or cx > 0.65 * width:
+                        side_faces.append((cx, cy, float(w), float(h)))
+                        break
+
         cap.release()
-        return None
 
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-    if face_cascade.empty():
-        print(f"Warning: Could not load Haar cascade from {cascade_path}")
-        cap.release()
-        return None
+        if len(side_faces) < 3:
+            print(f"Streamer cam detection: Only {len(side_faces)}/12 side faces detected. No webcam box.")
+            return None
 
-    frame_indices = np.linspace(0, total_frames - 1, num=12, dtype=int)
-    side_faces = []
+        med_cx = float(np.median([f[0] for f in side_faces]))
+        med_cy = float(np.median([f[1] for f in side_faces]))
+        med_bw = float(np.median([f[2] for f in side_faces]))
+        med_bh = float(np.median([f[3] for f in side_faces]))
+        print(f"Streamer cam detected! Detected {len(side_faces)} side faces. Median center: ({med_cx:.1f}, {med_cy:.1f}), size: ({med_bw:.1f}, {med_bh:.1f})")
 
-    for idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detected = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-
-        if len(detected) > 0:
-            for (x, y, w, h) in detected:
-                cx = x + w / 2.0
-                cy = y + h / 2.0
-                if cx < 0.35 * width or cx > 0.65 * width:
-                    side_faces.append((cx, cy, float(w), float(h)))
-                    break
-
-    cap.release()
-
-    if len(side_faces) < 3:
-        print(f"Streamer cam detection: Only {len(side_faces)}/12 side faces detected. No webcam box.")
-        return None
-
-    med_cx = float(np.median([f[0] for f in side_faces]))
-    med_cy = float(np.median([f[1] for f in side_faces]))
-    med_bw = float(np.median([f[2] for f in side_faces]))
-    med_bh = float(np.median([f[3] for f in side_faces]))
-    print(f"Streamer cam detected! Detected {len(side_faces)} side faces. Median center: ({med_cx:.1f}, {med_cy:.1f}), size: ({med_bw:.1f}, {med_bh:.1f})")
-
-    target_aspect = 1080.0 / 680.0
-    crop_h = int(med_bh * 3.2)
-    crop_w = int(crop_h * target_aspect)
-
-    min_h = int(height * 0.35)
-    if crop_h < min_h:
-        crop_h = min_h
+        target_aspect = 1080.0 / 680.0
+        crop_h = int(med_bh * 3.2)
         crop_w = int(crop_h * target_aspect)
 
-    if crop_w > width:
-        crop_w = width
-        crop_h = int(crop_w / target_aspect)
-    if crop_h > height:
-        crop_h = height
-        crop_w = int(crop_h * target_aspect)
+        min_h = int(height * 0.35)
+        if crop_h < min_h:
+            crop_h = min_h
+            crop_w = int(crop_h * target_aspect)
 
-    target_cy = med_cy + med_bh * 0.15
-    crop_x = int(med_cx - crop_w / 2.0)
-    crop_y = int(target_cy - crop_h / 2.0)
+        if crop_w > width:
+            crop_w = width
+            crop_h = int(crop_w / target_aspect)
+        if crop_h > height:
+            crop_h = height
+            crop_w = int(crop_h * target_aspect)
 
-    crop_x = max(0, min(crop_x, width - crop_w))
-    crop_y = max(0, min(crop_y, height - crop_h))
+        target_cy = med_cy + med_bh * 0.15
+        crop_x = int(med_cx - crop_w / 2.0)
+        crop_y = int(target_cy - crop_h / 2.0)
 
-    crop_w = crop_w - (crop_w % 2)
-    crop_h = crop_h - (crop_h % 2)
-    crop_x = crop_x - (crop_x % 2)
-    crop_y = crop_y - (crop_y % 2)
+        crop_x = max(0, min(crop_x, width - crop_w))
+        crop_y = max(0, min(crop_y, height - crop_h))
 
-    return (crop_x, crop_y, crop_w, crop_h)
+        crop_w = crop_w - (crop_w % 2)
+        crop_h = crop_h - (crop_h % 2)
+        crop_x = crop_x - (crop_x % 2)
+        crop_y = crop_y - (crop_y % 2)
+
+        return (crop_x, crop_y, crop_w, crop_h)
+
+    except Exception as e:
+        print(f"Warning: Streamer cam detection encountered an error ({e}). Falling back to full-screen vertical framing.")
+        return None
 
 
 def get_daily_counts():

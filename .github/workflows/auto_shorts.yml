@@ -29,8 +29,9 @@ jobs:
         run: |
           pip install --no-cache-dir \
             yt-dlp faster-whisper requests \
-            google-api-python-client google-auth-oauthlib nudenet \
-            opencv-python-headless google-genai
+            google-api-python-client google-auth-oauthlib \
+            nudenet google-genai
+          pip install --no-cache-dir --force-reinstall opencv-contrib-python-headless
 
       - name: Run pipeline
         env:
