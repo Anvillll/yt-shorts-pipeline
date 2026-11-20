@@ -28,6 +28,7 @@ PROCESSED = set(PROCESSED_FILE.read_text().splitlines()) if PROCESSED_FILE.exist
 
 MAX_YT_PER_DAY = 1  # 1 YouTube Short per UTC day
 MAX_IG_PER_DAY = 3  # Up to 3 Instagram Reels per UTC day (Morning, Noon, Night)
+MAX_UPLOAD_ATTEMPTS_PER_RUN = 3  # Max candidate clips to render/attempt per single CI run
 FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Progressive fallback windows
 
 PRIORITY_STREAMERS = [
@@ -180,7 +181,7 @@ def detect_streamer_cam(video_path):
                 detected = frontal_cascade.detectMultiScale(
                     gray, scaleFactor=1.1, minNeighbors=3, minSize=(36, 36)
                 )
-                if len(detected) > 0:
+                if detected is not None and len(detected) > 0:
                     all_detections.extend(detected.tolist())
 
             # Profile face detection (normal orientation)
@@ -188,7 +189,7 @@ def detect_streamer_cam(video_path):
                 detected_p = profile_cascade.detectMultiScale(
                     gray, scaleFactor=1.1, minNeighbors=3, minSize=(36, 36)
                 )
-                if len(detected_p) > 0:
+                if detected_p is not None and len(detected_p) > 0:
                     all_detections.extend(detected_p.tolist())
 
                 # Profile detection on horizontally flipped frame (catches right-side profiles)
@@ -196,7 +197,7 @@ def detect_streamer_cam(video_path):
                 detected_pf = profile_cascade.detectMultiScale(
                     flipped, scaleFactor=1.1, minNeighbors=3, minSize=(36, 36)
                 )
-                if len(detected_pf) > 0:
+                if detected_pf is not None and len(detected_pf) > 0:
                     for (fx, fy, fw, fh) in detected_pf:
                         # Mirror x coordinate back to original frame
                         orig_x = width - fx - fw
@@ -557,8 +558,8 @@ def fallback_metadata(broadcaster, raw_title):
 def generate_ai_metadata(broadcaster, raw_title, transcript):
     """
     Calls Google AI Studio Gemini API (google-genai SDK) to generate viral
-    hook_title, yt_title, and ig_caption. Tries gemini-2.5-flash first,
-    then falls back to gemini-2.0-flash. If both fail, uses fallback_metadata().
+    hook_title, yt_title, and ig_caption. Tries gemini-3.8-flash first,
+    then falls back to gemini-2.5-flash. If both fail, uses fallback_metadata().
     Uses v1beta API version to support JSON mode and newer endpoints cleanly.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -573,7 +574,7 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
         f"Spoken Transcript: {transcript}\n\n"
         f"Based on this context, return a strictly valid JSON object with EXACTLY these three fields:\n"
         f"1. 'hook_title': A bold, curiosity-driven 2-line on-screen hook for the middle seam of the video. "
-        f"Maximum 48 characters total, separated by '\\N' for the line break (e.g. 'LINE 1\\NLINE 2'). "
+        f"Maximum 48 characters total. Separate the two lines with a standard newline '\\n' or a pipe '|' (e.g. 'LINE 1\\nLINE 2' or 'LINE 1|LINE 2'). "
         f"Strictly uppercase standard ASCII letters, numbers, and basic punctuation only. NO emojis, NO underscores. "
         f"Write a complete, punchy 2-line hook (max 24 characters per line, 2 lines max) that finishes its thought "
         f"cleanly—never end mid-sentence or with an unclosed quote.\n"
@@ -584,7 +585,7 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
         f"Return ONLY the raw JSON object, without markdown formatting or code blocks."
     )
 
-    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash"]
+    models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash"]
 
     for model_name in models_to_try:
         try:
@@ -599,8 +600,9 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
             text = response.text.strip()
             data = json.loads(text)
 
-            hook_title = data.get("hook_title", "").strip().upper()
-            # Clean to standard ASCII, replace actual newlines with \N, strip unwanted characters
+            raw_hook = data.get("hook_title", "").strip().upper()
+            # Convert standard \n or pipe into ASS newline \N safely (never decoding raw \N in JSON)
+            hook_title = raw_hook.replace("\\n", "\n").replace("|", "\n")
             hook_title = hook_title.replace("\r", "").replace("\n", "\\N")
             hook_title = "".join(c for c in hook_title if 32 <= ord(c) < 127)
             # Ensure max ~48 characters total
@@ -829,6 +831,8 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
             },
             timeout=20
         )
+        if create_rel_res.status_code >= 400:
+            print(f"GitHub release creation error HTTP {create_rel_res.status_code}: {create_rel_res.text}")
         create_rel_res.raise_for_status()
         rel_data = create_rel_res.json()
         release_id = rel_data["id"]
@@ -844,9 +848,25 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
         print(f"Uploading video asset to temporary release ({asset_name})...")
         with open(video_path, "rb") as f:
             up_res = requests.post(upload_asset_url, headers=headers_upload, data=f, timeout=120)
+        if up_res.status_code >= 400:
+            print(f"GitHub asset upload error HTTP {up_res.status_code}: {up_res.text}")
         up_res.raise_for_status()
         browser_download_url = up_res.json().get("browser_download_url")
         print(f"Temporary asset download URL: {browser_download_url}")
+
+        # Wait 2 seconds for GitHub release asset CDN to propagate
+        time.sleep(2)
+
+        # Resolve 302 redirect to the direct CDN URL for Meta's crawler
+        direct_video_url = browser_download_url
+        try:
+            head_res = requests.head(browser_download_url, allow_redirects=True, timeout=15)
+            if head_res.status_code >= 400:
+                print(f"GitHub asset HEAD error HTTP {head_res.status_code}: {head_res.text}")
+            direct_video_url = head_res.url or browser_download_url
+        except Exception as e:
+            print(f"Could not resolve direct CDN URL ({e}). Falling back to release asset URL.")
+        print(f"Resolved direct CDN video URL: {direct_video_url}")
 
         # 3. Create Reels container via Instagram Graph API
         print("Creating Instagram Reels media container...")
@@ -855,12 +875,14 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
             container_url,
             data={
                 "media_type": "REELS",
-                "video_url": browser_download_url,
+                "video_url": direct_video_url,
                 "caption": ig_caption,
                 "access_token": ig_access_token,
             },
             timeout=30
         )
+        if c_res.status_code >= 400:
+            print(f"Instagram container creation error HTTP {c_res.status_code}: {c_res.text}")
         c_res.raise_for_status()
         creation_id = c_res.json().get("id")
         print(f"Reels container created. Creation ID: {creation_id}")
@@ -877,6 +899,8 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
                 params={"fields": "status_code", "access_token": ig_access_token},
                 timeout=15
             )
+            if s_res.status_code >= 400:
+                print(f"Instagram status check error HTTP {s_res.status_code}: {s_res.text}")
             s_res.raise_for_status()
             status_code = s_res.json().get("status_code")
             print(f"Instagram container status: {status_code}")
@@ -898,6 +922,8 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
             data={"creation_id": creation_id, "access_token": ig_access_token},
             timeout=30
         )
+        if p_res.status_code >= 400:
+            print(f"Instagram publish error HTTP {p_res.status_code}: {p_res.text}")
         p_res.raise_for_status()
         published_id = p_res.json().get("id")
         print(f"Successfully published Instagram Reel! Reel ID: {published_id}")
@@ -933,21 +959,23 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
     ass_path = Path(f"{clip_id}.ass")
     out_mp4 = Path(f"{clip_id}_short.mp4")
 
+    attempted_upload = False
+
     try:
-        subprocess.run(["yt-dlp", "-f", "mp4", "-o", str(raw_mp4), clip["url"]], check=True)
+        subprocess.run(["yt-dlp", "-f", "b[ext=mp4]/mp4", "-o", str(raw_mp4), clip["url"]], check=True)
 
         # 1. Strict Nudity & Adult-Content Guard
         if contains_nsfw(raw_mp4):
             print(f"WARNING: Clip {clip_id} flagged for NSFW/nudity content! Skipping.")
             mark_processed(clip_id)
-            return False
+            return False, False
 
         # 2. Audio transcription & English check
         words, info, transcript = transcribe_and_verify(raw_mp4)
         if words is None:
             print(f"Clip {clip_id} audio was not verified English. Skipping.")
             mark_processed(clip_id)
-            return False
+            return False, False
 
         # 3. Detect streamer webcam position (1080:680 box)
         cam_box = detect_streamer_cam(raw_mp4)
@@ -968,6 +996,8 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
         # 7. Render stacked split-screen vertical video (top 1080x680 webcam, bottom 1080x1240 gameplay)
         render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box)
 
+        # Clip has passed checks, rendered successfully, and is ready for upload attempt
+        attempted_upload = True
         any_upload_succeeded = False
 
         # 8. Upload to YouTube (if within daily limit)
@@ -995,12 +1025,12 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
             print("Instagram daily limit reached for today. Skipping Instagram upload.")
 
         mark_processed(clip_id)
-        return any_upload_succeeded
+        return any_upload_succeeded, attempted_upload
 
     except Exception as e:
         print(f"Error processing clip {clip_id}: {e}")
         mark_processed(clip_id)
-        return False
+        return False, attempted_upload
 
     finally:
         for p in (raw_mp4, ass_path, out_mp4):
@@ -1026,6 +1056,7 @@ def main():
         return
 
     uploaded = False
+    upload_attempts = 0
 
     # Stage 1: Prioritize top streamers first
     print("\n=== Stage 1: Checking Priority Streamers for GTA VI Clips ===")
@@ -1073,10 +1104,18 @@ def main():
                     mark_processed(clip_id)
                     continue
 
-                if process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
+                success, attempted = process_and_upload_candidate(clip, can_upload_yt, can_upload_ig)
+                if attempted:
+                    upload_attempts += 1
+
+                if success:
                     uploaded = True
                     print(f"Successfully processed and published priority streamer clip {clip_id} from {p_hours}h window!")
                     break
+
+                if upload_attempts >= MAX_UPLOAD_ATTEMPTS_PER_RUN:
+                    print("Reached max upload attempts for this run. Exiting cleanly.")
+                    return
 
             if uploaded:
                 break
@@ -1118,10 +1157,18 @@ def main():
                     continue
 
                 # Process candidate and upload to eligible platforms
-                if process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
+                success, attempted = process_and_upload_candidate(clip, can_upload_yt, can_upload_ig)
+                if attempted:
+                    upload_attempts += 1
+
+                if success:
                     uploaded = True
                     print(f"Successfully processed and published clip {clip_id} from {hours}h window!")
                     break
+
+                if upload_attempts >= MAX_UPLOAD_ATTEMPTS_PER_RUN:
+                    print("Reached max upload attempts for this run. Exiting cleanly.")
+                    return
 
             if uploaded:
                 break
