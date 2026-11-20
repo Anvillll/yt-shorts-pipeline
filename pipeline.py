@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import time
 import cv2
 import numpy as np
@@ -110,14 +111,13 @@ def get_video_duration(video_path):
 
 def detect_streamer_cam(video_path):
     """
-    Sample 12 evenly spaced frames using OpenCV.
-    Detect faces using OpenCV built-in Haar Cascade classifier.
-    Filter for faces on sides (face_cx < 0.35 * width or face_cx > 0.65 * width).
-    If >= 3 frames detect side face, compute median (face_cx, face_cy, face_w, face_h)
-    and return crop box (crop_x, crop_y, crop_w, crop_h) with 1080:680 (~1.59:1)
-    aspect ratio centered around streamer's median face coordinates (padded to show
-    head, shoulders, headset, clamped inside frame bounds).
-    Safely catches any OpenCV initialization errors and falls back to None.
+    Sample 16 evenly spaced frames using OpenCV.
+    Detect faces using BOTH frontalface and profileface Haar Cascade classifiers
+    (including horizontally-flipped frames for right-side profiles).
+    Filter for faces on sides (face_cx < 0.38 * width or face_cx > 0.62 * width).
+    If >= 2 frames detect side face, compute median and return crop box with 1080:680
+    aspect ratio. If < 2 faces detected, use smart corner fallback (top-left 32% crop).
+    Returns None only if the video cannot be opened at all.
     """
     try:
         if not hasattr(cv2, "CascadeClassifier"):
@@ -136,14 +136,29 @@ def detect_streamer_cam(video_path):
             cap.release()
             return None
 
-        cascade_path = getattr(getattr(cv2, "data", None), "haarcascades", "") + "haarcascade_frontalface_default.xml"
-        face_cascade = cv2.CascadeClassifier(cascade_path)
-        if face_cascade.empty():
-            print(f"Warning: Could not load Haar cascade from {cascade_path}. Falling back to full-screen.")
-            cap.release()
-            return None
+        # Load both frontal and profile cascades
+        haarcascades_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
+        frontal_path = haarcascades_dir + "haarcascade_frontalface_default.xml"
+        profile_path = haarcascades_dir + "haarcascade_profileface.xml"
 
-        frame_indices = np.linspace(0, total_frames - 1, num=12, dtype=int)
+        frontal_cascade = cv2.CascadeClassifier(frontal_path)
+        profile_cascade = cv2.CascadeClassifier(profile_path)
+
+        has_frontal = not frontal_cascade.empty()
+        has_profile = not profile_cascade.empty()
+
+        if not has_frontal and not has_profile:
+            print(f"Warning: Could not load any Haar cascade. Falling back to corner crop.")
+            cap.release()
+            # Smart corner fallback
+            crop_w = int(width * 0.32)
+            crop_h = int(crop_w / (1080.0 / 680.0))
+            crop_w = crop_w - (crop_w % 2)
+            crop_h = crop_h - (crop_h % 2)
+            print(f"Using smart corner fallback: top-left crop ({crop_w}x{crop_h})")
+            return (0, 0, crop_w, crop_h)
+
+        frame_indices = np.linspace(0, total_frames - 1, num=16, dtype=int)
         side_faces = []
 
         for idx in frame_indices:
@@ -153,21 +168,53 @@ def detect_streamer_cam(video_path):
                 continue
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            detected = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+            all_detections = []
 
-            if len(detected) > 0:
-                for (x, y, w, h) in detected:
+            # Frontal face detection
+            if has_frontal:
+                detected = frontal_cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=3, minSize=(36, 36)
+                )
+                if len(detected) > 0:
+                    all_detections.extend(detected.tolist())
+
+            # Profile face detection (normal orientation)
+            if has_profile:
+                detected_p = profile_cascade.detectMultiScale(
+                    gray, scaleFactor=1.1, minNeighbors=3, minSize=(36, 36)
+                )
+                if len(detected_p) > 0:
+                    all_detections.extend(detected_p.tolist())
+
+                # Profile detection on horizontally flipped frame (catches right-side profiles)
+                flipped = cv2.flip(gray, 1)
+                detected_pf = profile_cascade.detectMultiScale(
+                    flipped, scaleFactor=1.1, minNeighbors=3, minSize=(36, 36)
+                )
+                if len(detected_pf) > 0:
+                    for (fx, fy, fw, fh) in detected_pf:
+                        # Mirror x coordinate back to original frame
+                        orig_x = width - fx - fw
+                        all_detections.append([orig_x, fy, fw, fh])
+
+            if all_detections:
+                for (x, y, w, h) in all_detections:
                     cx = x + w / 2.0
                     cy = y + h / 2.0
-                    if cx < 0.35 * width or cx > 0.65 * width:
+                    if cx < 0.38 * width or cx > 0.62 * width:
                         side_faces.append((cx, cy, float(w), float(h)))
                         break
 
         cap.release()
 
-        if len(side_faces) < 3:
-            print(f"Streamer cam detection: Only {len(side_faces)}/12 side faces detected. No webcam box.")
-            return None
+        if len(side_faces) < 2:
+            # Smart corner fallback: top-left 32% crop at 1080:680 ratio
+            crop_w = int(width * 0.32)
+            crop_h = int(crop_w / (1080.0 / 680.0))
+            crop_w = crop_w - (crop_w % 2)
+            crop_h = crop_h - (crop_h % 2)
+            print(f"Streamer cam detection: Only {len(side_faces)}/16 side faces detected. Using smart corner fallback ({crop_w}x{crop_h}).")
+            return (0, 0, crop_w, crop_h)
 
         med_cx = float(np.median([f[0] for f in side_faces]))
         med_cy = float(np.median([f[1] for f in side_faces]))
@@ -448,31 +495,21 @@ def fallback_metadata(broadcaster, raw_title):
     clean_title = re.sub(r"#\S+", "", clean_title)
     clean_title = "".join(c for c in clean_title if 32 <= ord(c) < 127).strip()
     clean_title = re.sub(r"\s+", " ", clean_title)
+    # Remove stray quote characters
+    clean_title = clean_title.replace('"', "").replace("'", "")
 
     clean_broadcaster = "".join(c for c in broadcaster if 32 <= ord(c) < 127).strip()
+
+    # Strip duplicate streamer prefix
+    if clean_broadcaster and clean_title.upper().startswith(clean_broadcaster.upper()):
+        clean_title = clean_title[len(clean_broadcaster):].lstrip(":- ").strip()
+
     prefix = f"{clean_broadcaster.upper()}: " if clean_broadcaster else ""
     full_text = f"{prefix}{clean_title}"
 
-    # Wrap to ~26 chars per line, max 2 lines
-    words = full_text.split()
-    line1, line2 = [], []
-    len1 = 0
-    for w in words:
-        w_len = len(w) + (1 if line1 else 0)
-        if len1 + w_len <= 26 and not line2:
-            line1.append(w)
-            len1 += w_len
-        else:
-            if len(" ".join(line2 + [w])) <= 26:
-                line2.append(w)
-            else:
-                if not line2:
-                    line2.append(w[:23] + "...")
-                break
-
-    l1 = " ".join(line1)
-    l2 = " ".join(line2)
-    hook = f"{l1}\\N{l2}" if l2 else l1
+    # Wrap at word boundaries, max 24 chars per line, max 2 lines
+    wrapped_lines = textwrap.wrap(full_text.upper(), width=24)[:2]
+    hook = "\\N".join(wrapped_lines) if wrapped_lines else full_text.upper()[:24]
 
     yt_title = f"{full_text[:75]} #Shorts"
     ig_caption = (
@@ -491,10 +528,10 @@ def fallback_metadata(broadcaster, raw_title):
 
 def generate_ai_metadata(broadcaster, raw_title, transcript):
     """
-    Calls Google AI Studio Gemini API (gemini-2.5-flash via google-genai SDK)
-    to generate viral hook_title, yt_title, and ig_caption.
+    Calls Google AI Studio Gemini API (google-genai SDK) to generate viral
+    hook_title, yt_title, and ig_caption. Tries gemini-2.5-flash first,
+    then falls back to gemini-2.0-flash. If both fail, uses fallback_metadata().
     Uses v1beta API version to support JSON mode and newer endpoints cleanly.
-    Falls back gracefully if key missing or call fails.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not gemini_key or not genai:
@@ -509,7 +546,9 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
         f"Based on this context, return a strictly valid JSON object with EXACTLY these three fields:\n"
         f"1. 'hook_title': A bold, curiosity-driven 2-line on-screen hook for the middle seam of the video. "
         f"Maximum 48 characters total, separated by '\\N' for the line break (e.g. 'LINE 1\\NLINE 2'). "
-        f"Strictly uppercase standard ASCII letters, numbers, and basic punctuation only. NO emojis, NO underscores.\n"
+        f"Strictly uppercase standard ASCII letters, numbers, and basic punctuation only. NO emojis, NO underscores. "
+        f"Write a complete, punchy 2-line hook (max 24 characters per line, 2 lines max) that finishes its thought "
+        f"cleanly—never end mid-sentence or with an unclosed quote.\n"
         f"2. 'yt_title': A catchy, high-CTR YouTube Shorts title under 75 characters that sparks immense curiosity and ends with '#Shorts'.\n"
         f"3. 'ig_caption': A 2-line engaging Instagram Reels caption summarizing the funny or crazy moment with a call-to-action "
         f"(such as 'Follow for daily GTA 6 clips!'), followed by a blank line and 12-15 relevant high-reach gaming/GTA VI hashtags "
@@ -517,53 +556,59 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
         f"Return ONLY the raw JSON object, without markdown formatting or code blocks."
     )
 
-    try:
-        client = genai.Client(api_key=gemini_key, http_options={"api_version": "v1beta"})
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
+    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash"]
+
+    for model_name in models_to_try:
+        try:
+            client = genai.Client(api_key=gemini_key, http_options={"api_version": "v1beta"})
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
             )
-        )
-        text = response.text.strip()
-        data = json.loads(text)
+            text = response.text.strip()
+            data = json.loads(text)
 
-        hook_title = data.get("hook_title", "").strip().upper()
-        # Clean to standard ASCII, replace actual newlines with \N, strip unwanted characters
-        hook_title = hook_title.replace("\r", "").replace("\n", "\\N")
-        hook_title = "".join(c for c in hook_title if 32 <= ord(c) < 127)
-        # Ensure max ~48 characters total
-        if len(hook_title.replace("\\N", " ")) > 48:
-            parts = hook_title.split("\\N")
-            if len(parts) >= 2:
-                hook_title = f"{parts[0][:24]}\\N{parts[1][:24]}"
-            else:
-                hook_title = hook_title[:48]
+            hook_title = data.get("hook_title", "").strip().upper()
+            # Clean to standard ASCII, replace actual newlines with \N, strip unwanted characters
+            hook_title = hook_title.replace("\r", "").replace("\n", "\\N")
+            hook_title = "".join(c for c in hook_title if 32 <= ord(c) < 127)
+            # Ensure max ~48 characters total
+            if len(hook_title.replace("\\N", " ")) > 48:
+                parts = hook_title.split("\\N")
+                if len(parts) >= 2:
+                    hook_title = f"{parts[0][:24]}\\N{parts[1][:24]}"
+                else:
+                    hook_title = hook_title[:48]
 
-        yt_title = data.get("yt_title", "").strip()
-        if not yt_title.endswith("#Shorts"):
-            yt_title = f"{yt_title[:67]} #Shorts"
-        else:
-            if len(yt_title) > 75:
+            yt_title = data.get("yt_title", "").strip()
+            if not yt_title.endswith("#Shorts"):
                 yt_title = f"{yt_title[:67]} #Shorts"
+            else:
+                if len(yt_title) > 75:
+                    yt_title = f"{yt_title[:67]} #Shorts"
 
-        ig_caption = data.get("ig_caption", "").strip()
+            ig_caption = data.get("ig_caption", "").strip()
 
-        if not hook_title or not yt_title or not ig_caption:
-            raise ValueError("Incomplete metadata fields from Gemini response.")
+            if not hook_title or not yt_title or not ig_caption:
+                raise ValueError("Incomplete metadata fields from Gemini response.")
 
-        print(f"Gemini AI Generated Hook: {hook_title}")
-        print(f"Gemini AI Generated YT Title: {yt_title}")
-        return {
-            "hook_title": hook_title,
-            "yt_title": yt_title,
-            "ig_caption": ig_caption
-        }
+            print(f"Gemini AI ({model_name}) Generated Hook: {hook_title}")
+            print(f"Gemini AI ({model_name}) Generated YT Title: {yt_title}")
+            return {
+                "hook_title": hook_title,
+                "yt_title": yt_title,
+                "ig_caption": ig_caption
+            }
 
-    except Exception as e:
-        print(f"Gemini metadata generation failed ({e}). Reverting to fallback.")
-        return fallback_metadata(broadcaster, raw_title)
+        except Exception as e:
+            print(f"Gemini {model_name} failed: {type(e).__name__}: {e}")
+            continue
+
+    print("All Gemini models failed. Reverting to fallback metadata.")
+    return fallback_metadata(broadcaster, raw_title)
 
 
 def write_ass_subtitles(remapped_words, ass_path, total_duration, hook_text, has_webcam=True):
