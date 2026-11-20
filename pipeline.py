@@ -30,6 +30,11 @@ MAX_YT_PER_DAY = 1  # 1 YouTube Short per UTC day
 MAX_IG_PER_DAY = 3  # Up to 3 Instagram Reels per UTC day (Morning, Noon, Night)
 FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Progressive fallback windows
 
+PRIORITY_STREAMERS = [
+    "kaicenat", "ishowspeed", "xqc", "caseoh_", "jynxzi",
+    "adinross", "stableronaldo", "plaqueboymax"
+]
+
 BLOCKED_KEYWORDS = [
     "strip", "stripclub", "club", "nsfw", "nude", "nudity", "naked",
     "18+", "xxx", "porn", "hentai", "boobs", "booty", "lapdance",
@@ -337,6 +342,29 @@ def get_gta6_game_id(token):
     r.raise_for_status()
     data = r.json().get("data", [])
     return data[0]["id"] if data else None
+
+
+def get_broadcaster_ids(token, usernames):
+    if not usernames:
+        return []
+    headers = {"Client-ID": os.environ["TWITCH_CLIENT_ID"], "Authorization": f"Bearer {token}"}
+    params = [("login", u) for u in usernames]
+    r = requests.get("https://api.twitch.tv/helix/users", headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    return [u["id"] for u in data if "id" in u]
+
+
+def fetch_clips_for_broadcaster(token, broadcaster_id, hours):
+    headers = {"Client-ID": os.environ["TWITCH_CLIENT_ID"], "Authorization": f"Bearer {token}"}
+    started_at = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    r = requests.get("https://api.twitch.tv/helix/clips", headers=headers, params={
+        "broadcaster_id": broadcaster_id,
+        "started_at": started_at,
+        "first": 20,
+    }, timeout=15)
+    r.raise_for_status()
+    return r.json().get("data", [])
 
 
 def fetch_clips_for_window(token, game_id, hours):
@@ -997,51 +1025,108 @@ def main():
         print("Grand Theft Auto VI category not found on Twitch.")
         return
 
-    # Check clips across progressive time windows
     uploaded = False
-    for hours in FALLBACK_HOURS:
-        print(f"\n--- Searching Twitch clips in the last {hours} hours window ---")
-        clips = fetch_clips_for_window(token, game_id, hours)
 
-        for clip in clips:
-            clip_id = clip["id"]
-            if clip_id in PROCESSED:
-                continue
+    # Stage 1: Prioritize top streamers first
+    print("\n=== Stage 1: Checking Priority Streamers for GTA VI Clips ===")
+    try:
+        broadcaster_ids = get_broadcaster_ids(token, PRIORITY_STREAMERS)
+        print(f"Found {len(broadcaster_ids)} broadcaster IDs for priority streamers.")
+    except Exception as e:
+        print(f"Failed to fetch priority broadcaster IDs: {e}")
+        broadcaster_ids = []
 
-            title = clip.get("title", "")
-            # Strict English check on metadata & title
-            if clip.get("language") != "en":
-                print(f"Skipping clip {clip_id}: language is '{clip.get('language')}', not 'en'.")
-                mark_processed(clip_id)
-                continue
+    if broadcaster_ids:
+        for p_hours in [24, 48]:
+            print(f"\n--- Checking Priority Streamers in the last {p_hours} hours ---")
+            priority_clips = []
+            for b_id in broadcaster_ids:
+                try:
+                    b_clips = fetch_clips_for_broadcaster(token, b_id, p_hours)
+                    for c in b_clips:
+                        if (
+                            c.get("game_id") == game_id
+                            and c.get("id") not in PROCESSED
+                            and (10 <= c.get("duration", 0) <= 60)
+                            and c.get("language") == "en"
+                        ):
+                            priority_clips.append(c)
+                except Exception as e:
+                    print(f"Error fetching clips for broadcaster {b_id}: {e}")
 
-            if not is_ascii_english_title(title):
-                print(f"Skipping clip {clip_id}: title failed ASCII English check ('{title}').")
-                mark_processed(clip_id)
-                continue
+            # Sort priority clips by view_count descending
+            priority_clips.sort(key=lambda c: c.get("view_count", 0), reverse=True)
 
-            # Nudity & adult-content keyword blocklist
-            if has_blocked_keywords(title):
-                print(f"Skipping clip {clip_id}: title contains blocked adult keyword ('{title}').")
-                mark_processed(clip_id)
-                continue
+            for clip in priority_clips:
+                clip_id = clip["id"]
+                if clip_id in PROCESSED:
+                    continue
 
-            duration = clip.get("duration", 0)
-            if not (10 <= duration <= 60):
-                print(f"Skipping clip {clip_id}: duration {duration}s not between 10-60s.")
-                mark_processed(clip_id)
-                continue
+                title = clip.get("title", "")
+                if not is_ascii_english_title(title):
+                    print(f"Skipping priority clip {clip_id}: title failed ASCII English check ('{title}').")
+                    mark_processed(clip_id)
+                    continue
 
-            # Process candidate and upload to eligible platforms
-            if process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
-                uploaded = True
-                print(f"Successfully processed and published clip {clip_id} from {hours}h window!")
+                if has_blocked_keywords(title):
+                    print(f"Skipping priority clip {clip_id}: title contains blocked adult keyword ('{title}').")
+                    mark_processed(clip_id)
+                    continue
+
+                if process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
+                    uploaded = True
+                    print(f"Successfully processed and published priority streamer clip {clip_id} from {p_hours}h window!")
+                    break
+
+            if uploaded:
                 break
 
-        if uploaded:
-            break
+    # Stage 2: General viral GTA VI clips fallback across progressive time windows
+    if not uploaded:
+        print("\n=== Stage 2: Falling back to General Viral GTA VI Clips ===")
+        for hours in FALLBACK_HOURS:
+            print(f"\n--- Searching Twitch clips in the last {hours} hours window ---")
+            clips = fetch_clips_for_window(token, game_id, hours)
 
-        print(f"No clean, valid clips found in {hours}h window. Expanding search window...")
+            for clip in clips:
+                clip_id = clip["id"]
+                if clip_id in PROCESSED:
+                    continue
+
+                title = clip.get("title", "")
+                # Strict English check on metadata & title
+                if clip.get("language") != "en":
+                    print(f"Skipping clip {clip_id}: language is '{clip.get('language')}', not 'en'.")
+                    mark_processed(clip_id)
+                    continue
+
+                if not is_ascii_english_title(title):
+                    print(f"Skipping clip {clip_id}: title failed ASCII English check ('{title}').")
+                    mark_processed(clip_id)
+                    continue
+
+                # Nudity & adult-content keyword blocklist
+                if has_blocked_keywords(title):
+                    print(f"Skipping clip {clip_id}: title contains blocked adult keyword ('{title}').")
+                    mark_processed(clip_id)
+                    continue
+
+                duration = clip.get("duration", 0)
+                if not (10 <= duration <= 60):
+                    print(f"Skipping clip {clip_id}: duration {duration}s not between 10-60s.")
+                    mark_processed(clip_id)
+                    continue
+
+                # Process candidate and upload to eligible platforms
+                if process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
+                    uploaded = True
+                    print(f"Successfully processed and published clip {clip_id} from {hours}h window!")
+                    break
+
+            if uploaded:
+                break
+
+            print(f"No clean, valid clips found in {hours}h window. Expanding search window...")
 
     if not uploaded:
         print("No valid GTA VI clips found across all progressive fallback windows.")
