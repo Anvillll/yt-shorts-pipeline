@@ -1,3 +1,4 @@
+import atexit
 import json
 import os
 import re
@@ -35,6 +36,8 @@ FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Progressive fallback windows
 UPLOAD_TARGET = os.getenv("UPLOAD_TARGET", "all").strip().lower()
 IST = timezone(timedelta(hours=5, minutes=30))
 MC_SCHEDULE_FILE = Path("mc_schedule.json")
+COOKIES_FILE = Path("cookies.txt")
+_COOKIES_CREATED_FROM_ENV = False
 
 MINECRAFT_CREATORS = ["@whereswrld", "@wemmbumc", "@DrDonutt", "@aCookieGod"]
 
@@ -481,10 +484,62 @@ def to_utc_iso(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _remove_runtime_cookies():
+    if not _COOKIES_CREATED_FROM_ENV:
+        return
+    try:
+        if COOKIES_FILE.exists():
+            COOKIES_FILE.unlink()
+            print("Removed runtime cookies.txt.")
+    except Exception as e:
+        print(f"Warning: Could not remove cookies.txt: {e}")
+
+
+def _ensure_cookies_file():
+    global _COOKIES_CREATED_FROM_ENV
+    if COOKIES_FILE.exists():
+        return
+    data = os.getenv("YT_COOKIES", "")
+    if not data.strip():
+        return
+    try:
+        COOKIES_FILE.write_text(
+            data if data.endswith("\n") else data + "\n",
+            encoding="utf-8",
+        )
+        _COOKIES_CREATED_FROM_ENV = True
+        atexit.register(_remove_runtime_cookies)
+        print("Created cookies.txt from YT_COOKIES secret.")
+    except Exception as e:
+        print(f"Warning: Could not create cookies.txt: {e}")
+
+
+def _youtube_auth_args(url):
+    if not url or ("youtube.com" not in url and "youtu.be" not in url):
+        return []
+    try:
+        if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
+            return ["--cookies", str(COOKIES_FILE), "--sleep-requests", "1"]
+    except Exception as e:
+        print(f"Warning: Could not check cookies.txt: {e}")
+    return []
+
+
+_ensure_cookies_file()
+
+
 def _yt_dlp_json(args, timeout=180):
+    url = next(
+        (
+            arg for arg in args
+            if isinstance(arg, str) and ("youtube.com" in arg or "youtu.be" in arg)
+        ),
+        "",
+    )
+    auth_args = _youtube_auth_args(url)
     try:
         res = subprocess.run(
-            ["yt-dlp", "--no-warnings", *args],
+            ["yt-dlp", "--no-warnings", *auth_args, *args],
             capture_output=True, text=True, timeout=timeout
         )
         if res.returncode != 0:
@@ -701,6 +756,7 @@ def download_video_slice(video_url, start_sec, end_sec, out_path):
     )
     cmd = [
         "yt-dlp", "--no-warnings", "--no-playlist",
+        *_youtube_auth_args(video_url),
         "-f", fmt,
         "--download-sections", f"*{start_sec:.3f}-{end_sec:.3f}",
         "--force-keyframes-at-cuts",
@@ -1706,7 +1762,7 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload
     attempted_upload = False
 
     try:
-        subprocess.run(["yt-dlp", "-f", "b[ext=mp4]/mp4", "-o", str(raw_mp4), clip["url"]], check=True)
+        subprocess.run(["yt-dlp", *_youtube_auth_args(clip["url"]), "-f", "b[ext=mp4]/mp4", "-o", str(raw_mp4), clip["url"]], check=True)
 
         # 1. Strict Nudity & Adult-Content Guard
         if contains_nsfw(raw_mp4):

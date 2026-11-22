@@ -34,9 +34,10 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --no-cache-dir \
-            yt-dlp faster-whisper requests \
+            faster-whisper requests \
             google-api-python-client google-auth-oauthlib \
             nudenet google-genai
+          pip install --no-cache-dir -U "yt-dlp[default]"
           pip install --no-cache-dir --force-reinstall opencv-contrib-python-headless
 
       - name: Run pipeline
@@ -48,13 +49,20 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_REFRESH_TOKEN_2: ${{ secrets.YT_REFRESH_TOKEN_2 }}
           YT_REFRESH_TOKEN_3: ${{ secrets.YT_REFRESH_TOKEN_3 }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
           PYTHONUNBUFFERED: "1"
           UPLOAD_TARGET: ${{ github.event.inputs.target || 'all' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python pipeline.py
+        run: |
+          if [ -n "$YT_COOKIES" ]; then printf '%s\n' "$YT_COOKIES" > cookies.txt; fi
+          python pipeline.py
+
+      - name: Remove cookies
+        if: always()
+        run: rm -f cookies.txt
 
       - name: Save processed clip IDs
         run: |
