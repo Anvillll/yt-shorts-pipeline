@@ -28,10 +28,15 @@ PROCESSED = set(PROCESSED_FILE.read_text().splitlines()) if PROCESSED_FILE.exist
 
 MAX_YT_PER_DAY = 1  # 1 YouTube Short per UTC day
 MAX_YT2_PER_DAY = 2  # 2 YouTube Shorts for Channel #2 per UTC day (Morning and Night IST runs)
+MAX_YT3_PER_DAY = 2  # Channel #3 Minecraft Shorts per day (09:00 and 21:00 IST slots)
 MAX_IG_PER_DAY = 3  # Up to 3 Instagram Reels per UTC day (Morning, Noon, Night)
 MAX_UPLOAD_ATTEMPTS_PER_RUN = 3  # Max candidate clips to render/attempt per single CI run
 FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Progressive fallback windows
 UPLOAD_TARGET = os.getenv("UPLOAD_TARGET", "all").strip().lower()
+IST = timezone(timedelta(hours=5, minutes=30))
+MC_SCHEDULE_FILE = Path("mc_schedule.json")
+
+MINECRAFT_CREATORS = ["@whereswrld", "@wemmbumc", "@DrDonutt", "@aCookieGod"]
 
 PRIORITY_STREAMERS = [
     "kaicenat", "ishowspeed", "xqc", "caseoh_", "jynxzi",
@@ -134,8 +139,9 @@ def detect_streamer_cam(video_path):
     (including horizontally-flipped frames for right-side profiles).
     Filter for faces on sides (face_cx < 0.38 * width or face_cx > 0.62 * width).
     If >= 2 frames detect side face, compute median and return crop box with 1080:680
-    aspect ratio. If < 2 faces detected, use smart corner fallback (top-left 32% crop).
-    Returns None only if the video cannot be opened at all.
+    aspect ratio. Otherwise returns None so callers can use a clean full-frame
+    vertical layout (never a blind corner/HUD crop).
+    Returns None if the video cannot be opened at all.
     """
     try:
         if not hasattr(cv2, "CascadeClassifier"):
@@ -166,15 +172,9 @@ def detect_streamer_cam(video_path):
         has_profile = not profile_cascade.empty()
 
         if not has_frontal and not has_profile:
-            print(f"Warning: Could not load any Haar cascade. Falling back to corner crop.")
+            print(f"Warning: Could not load any Haar cascade. Falling back to full-screen vertical framing.")
             cap.release()
-            # Smart corner fallback
-            crop_w = int(width * 0.32)
-            crop_h = int(crop_w / (1080.0 / 680.0))
-            crop_w = crop_w - (crop_w % 2)
-            crop_h = crop_h - (crop_h % 2)
-            print(f"Using smart corner fallback: top-left crop ({crop_w}x{crop_h})")
-            return (0, 0, crop_w, crop_h)
+            return None
 
         frame_indices = np.linspace(0, total_frames - 1, num=16, dtype=int)
         side_faces = []
@@ -226,13 +226,8 @@ def detect_streamer_cam(video_path):
         cap.release()
 
         if len(side_faces) < 2:
-            # Smart corner fallback: top-left 32% crop at 1080:680 ratio
-            crop_w = int(width * 0.32)
-            crop_h = int(crop_w / (1080.0 / 680.0))
-            crop_w = crop_w - (crop_w % 2)
-            crop_h = crop_h - (crop_h % 2)
-            print(f"Streamer cam detection: Only {len(side_faces)}/16 side faces detected. Using smart corner fallback ({crop_w}x{crop_h}).")
-            return (0, 0, crop_w, crop_h)
+            print(f"Streamer cam detection: Only {len(side_faces)}/16 side faces detected. Using full-frame vertical layout.")
+            return None
 
         med_cx = float(np.median([f[0] for f in side_faces]))
         med_cy = float(np.median([f[1] for f in side_faces]))
@@ -273,6 +268,59 @@ def detect_streamer_cam(video_path):
     except Exception as e:
         print(f"Warning: Streamer cam detection encountered an error ({e}). Falling back to full-screen vertical framing.")
         return None
+
+
+def detect_facecam_safe(video_path):
+    """
+    Safe facecam wrapper. Returns a validated (x, y, w, h) box or None.
+    Never raises, and never returns a blind corner/HUD crop when no confident
+    facecam is present, so faceless videos fall back to a clean full-frame layout.
+    """
+    try:
+        box = detect_streamer_cam(video_path)
+    except Exception as e:
+        print(f"Facecam detection error ({e}); using full-frame vertical layout.")
+        return None
+
+    if not box or len(box) != 4:
+        print("No confident facecam detected; using full-frame vertical layout.")
+        return None
+
+    try:
+        x, y, w, h = (int(v) for v in box)
+    except (TypeError, ValueError):
+        print("Invalid facecam box; using full-frame vertical layout.")
+        return None
+
+    if w < 160 or h < 100:
+        print(f"Facecam box too small ({w}x{h}); using full-frame vertical layout.")
+        return None
+
+    frame_w = frame_h = 0
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if cap.isOpened():
+            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+    except Exception as e:
+        print(f"Could not validate facecam bounds ({e}); using full-frame vertical layout.")
+        return None
+
+    if frame_w <= 0 or frame_h <= 0:
+        print("Could not read video dimensions; using full-frame vertical layout.")
+        return None
+
+    x = max(0, min(x, frame_w - 2))
+    y = max(0, min(y, frame_h - 2))
+    w = min(w, frame_w - x)
+    h = min(h, frame_h - y)
+
+    if w < 160 or h < 100:
+        print("Facecam box exceeds frame bounds; using full-frame vertical layout.")
+        return None
+
+    return (x, y, w, h)
 
 
 def get_daily_counts():
@@ -354,6 +402,413 @@ def is_yt2_time_window():
     """
     now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     return now_ist.hour < 12 or now_ist.hour >= 18
+
+
+def ist_now():
+    return datetime.now(IST)
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def parse_utc(value):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def load_mc_schedule():
+    schedule = {"yt3_last_scheduled_utc": None, "yt2_morning_scheduled_dates": []}
+    try:
+        if MC_SCHEDULE_FILE.exists():
+            data = json.loads(MC_SCHEDULE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                schedule["yt3_last_scheduled_utc"] = data.get("yt3_last_scheduled_utc")
+                dates = data.get("yt2_morning_scheduled_dates") or []
+                if isinstance(dates, list):
+                    schedule["yt2_morning_scheduled_dates"] = [str(d) for d in dates]
+    except Exception as e:
+        print(f"Warning: Could not read {MC_SCHEDULE_FILE} ({e}). Starting fresh.")
+    return schedule
+
+
+def save_mc_schedule(schedule):
+    try:
+        MC_SCHEDULE_FILE.write_text(json.dumps(schedule, indent=2), encoding="utf-8")
+        print(f"Saved Minecraft schedule: {schedule}")
+    except Exception as e:
+        print(f"Warning: Could not write {MC_SCHEDULE_FILE}: {e}")
+
+
+def yt3_queue_is_resting(schedule):
+    last = parse_utc(schedule.get("yt3_last_scheduled_utc"))
+    if last is None:
+        return False
+    return last > utc_now() + timedelta(minutes=30)
+
+
+def next_ist_slots(count, morning_only=False):
+    """Return the next `count` 09:00/21:00 IST slots strictly in the future."""
+    now = ist_now()
+    slots = []
+    day = now.date()
+    while len(slots) < count:
+        times = [(9, 0)] if morning_only else [(9, 0), (21, 0)]
+        for hh, mm in times:
+            slot = datetime(day.year, day.month, day.day, hh, mm, tzinfo=IST)
+            if slot > now + timedelta(minutes=2):
+                slots.append(slot)
+                if len(slots) >= count:
+                    break
+        day = day + timedelta(days=1)
+    return slots
+
+
+def next_morning_ist_slot(day_offset=0):
+    now = ist_now()
+    base = now.date() + timedelta(days=day_offset)
+    return datetime(base.year, base.month, base.day, 9, 0, tzinfo=IST)
+
+
+def to_utc_iso(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _yt_dlp_json(args, timeout=180):
+    try:
+        res = subprocess.run(
+            ["yt-dlp", "--no-warnings", *args],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if res.returncode != 0:
+            print(f"yt-dlp failed: {res.stderr.strip()[:300]}")
+            return None
+        return json.loads(res.stdout)
+    except Exception as e:
+        print(f"yt-dlp error: {e}")
+        return None
+
+
+def _parse_upload_ts(entry):
+    ts = entry.get("timestamp") or entry.get("release_timestamp")
+    if isinstance(ts, (int, float)):
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    upload_date = entry.get("upload_date")
+    if upload_date:
+        try:
+            return datetime.strptime(str(upload_date), "%Y%m%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def select_minecraft_video(processed_ids):
+    """
+    Select a long-form Minecraft video using strict creator priority order.
+    Uses yt-dlp flat playlist extraction (latest 6 videos per creator).
+    Filters out Shorts (< 180s) and videos already present in processed.txt.
+    Pass 1: first creator (priority order) with an unused video from the last 7
+    days -> highest view_count. Pass 2: first creator with any unused long-form
+    video -> most recent.
+    """
+    recent_cutoff = utc_now() - timedelta(days=7)
+    creator_candidates = []
+
+    for handle in MINECRAFT_CREATORS:
+        url = f"https://www.youtube.com/{handle}/videos"
+        data = _yt_dlp_json(["--flat-playlist", "--dump-single-json", "--playlist-end", "6", url])
+        entries = (data or {}).get("entries") or []
+        candidates = []
+        for entry in entries[:6]:
+            if not isinstance(entry, dict):
+                continue
+            video_id = entry.get("id")
+            duration = entry.get("duration")
+            if not video_id or video_id in processed_ids:
+                continue
+            if duration is not None and duration < 180:
+                continue
+            entry_url = entry.get("url") or ""
+            if not entry_url.startswith("http"):
+                entry_url = f"https://www.youtube.com/watch?v={video_id}"
+            candidates.append({
+                "id": video_id,
+                "url": entry_url,
+                "title": entry.get("title") or "",
+                "duration": duration,
+                "view_count": entry.get("view_count") or 0,
+                "timestamp": _parse_upload_ts(entry),
+                "creator": handle,
+            })
+        creator_candidates.append((handle, candidates))
+
+    for handle, candidates in creator_candidates:
+        recent = [
+            c for c in candidates
+            if c["timestamp"] is not None and c["timestamp"] >= recent_cutoff
+        ]
+        if recent:
+            pick = max(recent, key=lambda c: c["view_count"])
+            print(f"Minecraft selection: {handle} -> {pick['id']} (recent, {pick['view_count']} views)")
+            return pick
+
+    for handle, candidates in creator_candidates:
+        if candidates:
+            dated = [c for c in candidates if c["timestamp"] is not None]
+            pick = max(dated, key=lambda c: c["timestamp"]) if dated else candidates[0]
+            print(f"Minecraft selection (fallback): {handle} -> {pick['id']}")
+            return pick
+
+    print("No unused Minecraft long-form videos found for any priority creator.")
+    return None
+
+
+def fetch_video_details(video_url):
+    data = _yt_dlp_json(["--dump-single-json", "--no-playlist", video_url])
+    return data or {}
+
+
+def _gemini_pick_windows(title, description, duration, need):
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key or not genai or need <= 0:
+        return []
+
+    prompt = (
+        "You are selecting highlight windows from a Minecraft YouTube video.\n"
+        f"Video title: {title}\n"
+        f"Video description: {description[:3000]}\n"
+        f"Total duration: {duration:.1f} seconds.\n"
+        f"Pick exactly {need} non-overlapping highlight windows, each 45-58 seconds long, "
+        "that are likely the most engaging, funny, or intense moments.\n"
+        'Return ONLY raw JSON: {"windows": [{"start_sec": 0.0, "end_sec": 50.0}]}\n'
+    )
+
+    for model_name in ["gemini-2.5-flash", "gemini-3.8-flash"]:
+        try:
+            client = genai.Client(api_key=gemini_key, http_options={"api_version": "v1beta"})
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            data = json.loads(response.text.strip())
+            windows = []
+            for item in data.get("windows") or []:
+                start = float(item.get("start_sec", 0))
+                end = float(item.get("end_sec", 0))
+                if 0 <= start < end <= duration and 45 <= (end - start) <= 58:
+                    windows.append((start, end))
+            if windows:
+                print(f"Gemini ({model_name}) selected {len(windows)} Minecraft windows.")
+                return windows
+        except Exception as e:
+            print(f"Gemini window selection {model_name} failed: {type(e).__name__}: {e}")
+    return []
+
+
+def pick_minecraft_windows(video_info, count=4):
+    duration = float(video_info.get("duration") or 0)
+    if duration <= 0:
+        return []
+
+    win = 52.0
+    max_fit = (duration / max(1, count)) - 2.0
+    if max_fit < win:
+        win = max(45.0, max_fit)
+
+    if duration < 45:
+        return [(0.0, max(10.0, duration))]
+
+    windows = []
+    heatmap = video_info.get("heatmap") or []
+
+    scored = []
+    if heatmap:
+        points = []
+        for seg in heatmap:
+            try:
+                start = float(seg.get("start_time", 0))
+                end = float(seg.get("end_time", start))
+                value = float(seg.get("value", 0))
+            except (TypeError, ValueError):
+                continue
+            if end > start:
+                points.append((start, end, value))
+        if points:
+            t = 0.0
+            while t + win <= duration + 0.01:
+                score = 0.0
+                for start, end, value in points:
+                    overlap = max(0.0, min(t + win, end) - max(t, start))
+                    if overlap > 0:
+                        score += value * overlap
+                scored.append((score, t))
+                t += 5.0
+    if scored:
+        scored.sort(key=lambda item: item[0], reverse=True)
+        for _, start in scored:
+            end = min(duration, start + win)
+            if end - start < 45:
+                continue
+            if all(end <= s or start >= e for s, e in windows):
+                windows.append((start, end))
+            if len(windows) >= count:
+                break
+
+    if len(windows) < count:
+        need = count - len(windows)
+        for start, end in _gemini_pick_windows(
+            video_info.get("title") or "",
+            video_info.get("description") or "",
+            duration,
+            need,
+        ):
+            if all(end <= s or start >= e for s, e in windows):
+                windows.append((start, end))
+            if len(windows) >= count:
+                break
+
+    if len(windows) < count:
+        span = duration / count
+        for i in range(count):
+            start = max(0.0, i * span + max(0.0, (span - win) / 2.0))
+            end = min(duration, start + win)
+            if end - start < 45:
+                continue
+            if all(end <= s or start >= e for s, e in windows):
+                windows.append((start, end))
+            if len(windows) >= count:
+                break
+
+    print(f"Minecraft windows selected: {[(round(s, 1), round(e, 1)) for s, e in windows[:count]]}")
+    return windows[:count]
+
+
+def download_video_slice(video_url, start_sec, end_sec, out_path):
+    fmt = (
+        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/"
+        "b[height<=1080][ext=mp4]/b[ext=mp4]/b"
+    )
+    cmd = [
+        "yt-dlp", "--no-warnings", "--no-playlist",
+        "-f", fmt,
+        "--download-sections", f"*{start_sec:.3f}-{end_sec:.3f}",
+        "--force-keyframes-at-cuts",
+        "-o", str(out_path),
+        video_url,
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def _clean_hook(raw):
+    raw_hook = (raw or "").strip().upper()
+    hook_title = raw_hook.replace("\\n", "\n").replace("|", "\n")
+    hook_title = hook_title.replace("\r", "").replace("\n", "\\N")
+    hook_title = "".join(c for c in hook_title if 32 <= ord(c) < 127)
+    if len(hook_title.replace("\\N", " ")) > 48:
+        parts = hook_title.split("\\N")
+        if len(parts) >= 2:
+            hook_title = f"{parts[0][:24]}\\N{parts[1][:24]}"
+        else:
+            hook_title = hook_title[:48]
+    return hook_title
+
+
+def _clean_yt_title(raw):
+    yt_title = (raw or "").strip()
+    if not yt_title.endswith("#Shorts"):
+        yt_title = f"{yt_title[:67]} #Shorts"
+    elif len(yt_title) > 75:
+        yt_title = f"{yt_title[:67]} #Shorts"
+    return yt_title
+
+
+def fallback_minecraft_metadata(creator, raw_title):
+    clean_title = re.sub(r"https?://\S+", "", raw_title or "")
+    clean_title = re.sub(r"#\S+", "", clean_title)
+    clean_title = "".join(c for c in clean_title if 32 <= ord(c) < 127).strip()
+    clean_title = re.sub(r"\s+", " ", clean_title).replace('"', "").replace("'", "")
+    full_text = clean_title or "MINECRAFT MOMENT"
+
+    wrapped_lines = textwrap.wrap(full_text.upper(), width=24)[:2]
+    hook = "\\N".join(wrapped_lines) if wrapped_lines else full_text.upper()[:24]
+
+    yt_title = f"{full_text[:75]} #Shorts"
+    description = (
+        f"{full_text}\n\n"
+        f"Minecraft gameplay from {creator}!\n\n"
+        "#Minecraft #MinecraftShorts #MinecraftClips #Gaming #GamingShorts "
+        "#Shorts #ViralGaming #Gamer #SurvivalMinecraft #MinecraftBuilds"
+    )
+    return {"hook_title": hook, "yt_title": yt_title, "description": description}
+
+
+def generate_minecraft_metadata(creator, raw_title, transcript):
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key or not genai:
+        return fallback_minecraft_metadata(creator, raw_title)
+
+    prompt = (
+        "You are an expert viral Minecraft Shorts creator.\n\n"
+        f"Creator: {creator}\n"
+        f"Original Video Title: {raw_title}\n"
+        f"Spoken Transcript: {transcript}\n\n"
+        "Return a strictly valid JSON object with EXACTLY these three fields:\n"
+        "1. 'hook_title': a bold 2-line on-screen hook, max 48 characters total, "
+        "two lines separated by a standard newline '\\n' or a pipe '|', uppercase "
+        "ASCII letters/numbers/basic punctuation only, no emojis or underscores.\n"
+        "2. 'yt_title': a catchy high-CTR YouTube Shorts title under 75 characters "
+        "ending with '#Shorts'.\n"
+        "3. 'description': a short 2-line description with a call-to-action followed "
+        "by 10-15 Minecraft/gaming hashtags.\n\n"
+        "Return ONLY the raw JSON object, without markdown formatting or code blocks."
+    )
+
+    for model_name in ["gemini-2.5-flash", "gemini-3.8-flash"]:
+        try:
+            client = genai.Client(api_key=gemini_key, http_options={"api_version": "v1beta"})
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            data = json.loads(response.text.strip())
+
+            hook_title = _clean_hook(data.get("hook_title", ""))
+            yt_title = _clean_yt_title(data.get("yt_title", ""))
+            description = (data.get("description") or "").strip()
+            if not description:
+                description = (
+                    f"{yt_title}\n\n"
+                    "#Minecraft #MinecraftShorts #MinecraftClips #Gaming #Shorts"
+                )
+
+            if not hook_title or not yt_title:
+                raise ValueError("Incomplete Minecraft metadata fields from Gemini response.")
+
+            print(f"Gemini AI ({model_name}) Minecraft Hook: {hook_title}")
+            print(f"Gemini AI ({model_name}) Minecraft Title: {yt_title}")
+            return {
+                "hook_title": hook_title,
+                "yt_title": yt_title,
+                "description": description,
+            }
+        except Exception as e:
+            print(f"Gemini {model_name} Minecraft metadata failed: {type(e).__name__}: {e}")
+            continue
+
+    print("All Gemini models failed for Minecraft metadata. Using fallback.")
+    return fallback_minecraft_metadata(creator, raw_title)
 
 
 def get_twitch_token():
@@ -709,8 +1164,11 @@ def render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box
          [0:v]crop=cw:ch:cx:cy,scale=1080:680[top];
          [0:v]scale=1080:1240:force_original_aspect_ratio=increase,crop=1080:1240[bottom];
          [top][bottom]vstack=inputs=2,ass=ass_path[outv]
-       - If no cam_box (fallback):
-         [0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,ass=ass_path[outv]
+       - If no cam_box (faceless fallback):
+         [0:v]split=2[bg][fg];
+         [bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:2[bgblur];
+         [fg]scale=1080:-2[fgscaled];
+         [bgblur][fgscaled]overlay=(W-w)/2:(H-h)/2,ass=ass_path[outv]
     """
     temp_dir = tempfile.mkdtemp(prefix="render_split_")
     try:
@@ -767,7 +1225,10 @@ def render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box
             )
         else:
             filtergraph = (
-                f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,ass={escaped_ass}[outv]"
+                f"[0:v]split=2[bg][fg];"
+                f"[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=24:2[bgblur];"
+                f"[fg]scale=1080:-2[fgscaled];"
+                f"[bgblur][fgscaled]overlay=(W-w)/2:(H-h)/2,ass={escaped_ass}[outv]"
             )
 
         final_cmd = [
@@ -787,7 +1248,15 @@ def render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def upload_youtube(video_path, title, refresh_token=None, channel_label="Primary"):
+def upload_youtube(
+    video_path,
+    title,
+    refresh_token=None,
+    channel_label="Primary",
+    privacy_status="public",
+    publish_at=None,
+    description=None,
+):
     refresh_token = refresh_token or os.getenv("YT_REFRESH_TOKEN")
     creds = Credentials(
         token=None,
@@ -797,21 +1266,29 @@ def upload_youtube(video_path, title, refresh_token=None, channel_label="Primary
         client_secret=os.environ["YT_CLIENT_SECRET"],
     )
     youtube = build("youtube", "v3", credentials=creds)
+
+    status = {
+        "privacyStatus": privacy_status,
+        "selfDeclaredMadeForKids": False,
+    }
+    if publish_at:
+        # YouTube requires scheduled uploads to be private with a future publishAt.
+        status["privacyStatus"] = "private"
+        status["publishAt"] = publish_at
+
     body = {
         "snippet": {
             "title": f"{title[:85]} #Shorts" if not title.endswith("#Shorts") else title[:95],
-            "description": f"{title}\n\n#Shorts #Gaming #GTAVI",
+            "description": description or f"{title}\n\n#Shorts #Gaming #GTAVI",
             "categoryId": "20",
         },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": status,
     }
     media = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True)
     req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     resp = req.execute()
     print(f"Uploaded YouTube Video ID ({channel_label}):", resp["id"])
+    return resp["id"]
 
 
 def upload_instagram_reel(video_path, ig_caption, clip_id):
@@ -980,6 +1457,242 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
             print(f"Failed to delete tag {tag_name}: {e}")
 
 
+def run_minecraft_batch(schedule, clip_count=4, upload_yt3=True, upload_yt2=False, yt2_count=0):
+    """
+    Select, render, and distribute a Minecraft batch without any NSFW scan.
+    Channel #3 receives Clip 1 public + Clips 2-4 scheduled (private/publishAt).
+    When upload_yt2 is set, reuse rendered clips for upcoming Channel #2 Morning
+    IST slots (no re-rendering).
+    """
+    video = select_minecraft_video(PROCESSED)
+    if not video:
+        return False
+
+    print(f"Selected Minecraft video: {video['id']} - '{video['title']}' ({video['creator']})")
+    info = fetch_video_details(video["url"])
+    if info:
+        video["title"] = info.get("title") or video["title"]
+        video["duration"] = info.get("duration") or video.get("duration")
+        video["creator"] = info.get("uploader") or video.get("creator")
+        video["view_count"] = info.get("view_count") or video.get("view_count")
+    if not info:
+        info = {}
+    info.setdefault("duration", video.get("duration") or 0)
+
+    duration = float(video.get("duration") or info.get("duration") or 0)
+    if duration and duration < 180:
+        print(f"Minecraft video {video['id']} is a Short (<180s). Marking processed and skipping.")
+        mark_processed(video["id"])
+        return False
+
+    windows = pick_minecraft_windows(info, count=clip_count)
+    if not windows:
+        print("Could not select Minecraft clip windows. Skipping batch.")
+        return False
+
+    rendered = []
+    temp_paths = []
+    uploaded_any = False
+
+    try:
+        for i, (start_sec, end_sec) in enumerate(windows):
+            slice_path = Path(f"mc_{video['id']}_{i + 1}_slice.mp4")
+            ass_path = Path(f"mc_{video['id']}_{i + 1}.ass")
+            out_path = Path(f"mc_{video['id']}_{i + 1}_short.mp4")
+            temp_paths.extend([slice_path, ass_path])
+
+            try:
+                print(f"Downloading Minecraft slice {i + 1}/{len(windows)}: {start_sec:.1f}-{end_sec:.1f}s")
+                download_video_slice(video["url"], start_sec, end_sec, slice_path)
+                dur = get_video_duration(slice_path)
+
+                words, _info, transcript = transcribe_and_verify(slice_path)
+                if words is None:
+                    words = []
+                    transcript = video.get("title", "")
+
+                remapped_words = [
+                    {"word": w.word, "start": max(0.0, w.start), "end": min(w.end, dur)}
+                    for w in words if w.start < dur
+                ]
+                cam_box = detect_facecam_safe(slice_path)
+                metadata = generate_minecraft_metadata(
+                    video.get("creator") or video["creator"],
+                    video.get("title") or "",
+                    transcript,
+                )
+                write_ass_subtitles(
+                    remapped_words, ass_path, dur, metadata["hook_title"],
+                    has_webcam=bool(cam_box),
+                )
+                render_split_vertical(
+                    slice_path, ass_path, out_path,
+                    [{"start": 0.0, "end": dur}], cam_box,
+                )
+                rendered.append({
+                    "path": out_path,
+                    "title": metadata["yt_title"],
+                    "description": metadata["description"],
+                    "start": start_sec,
+                    "end": end_sec,
+                })
+                print(f"Rendered Minecraft clip {i + 1}: {out_path}")
+            except Exception as e:
+                print(f"Minecraft slice {i + 1} failed: {e}")
+                continue
+
+        if not rendered:
+            print("No Minecraft clips rendered successfully.")
+            return False
+
+        yt3_token = os.getenv("YT_REFRESH_TOKEN_3", "").strip()
+
+        if upload_yt3 and yt3_token:
+            # Clip 1: publish immediately.
+            try:
+                video_id = upload_youtube(
+                    rendered[0]["path"],
+                    rendered[0]["title"],
+                    refresh_token=yt3_token,
+                    channel_label="Channel #3",
+                    privacy_status="public",
+                    description=rendered[0]["description"],
+                )
+                uploaded_any = True
+                print(f"Channel #3 immediate upload: {video_id}")
+            except Exception as e:
+                print(f"Channel #3 immediate upload failed: {e}")
+
+            # Clips 2-4: schedule at the next 09:00/21:00 IST slots.
+            scheduled_clips = rendered[1:4]
+            if scheduled_clips:
+                slots = next_ist_slots(len(scheduled_clips))
+                last_scheduled = None
+                for clip, slot in zip(scheduled_clips, slots):
+                    publish_at = to_utc_iso(slot)
+                    try:
+                        video_id = upload_youtube(
+                            clip["path"],
+                            clip["title"],
+                            refresh_token=yt3_token,
+                            channel_label="Channel #3",
+                            privacy_status="private",
+                            publish_at=publish_at,
+                            description=clip["description"],
+                        )
+                        uploaded_any = True
+                        last_scheduled = publish_at
+                        print(f"Channel #3 scheduled upload: {video_id} at {publish_at}")
+                    except Exception as e:
+                        print(f"Channel #3 scheduled upload failed for {publish_at}: {e}")
+                if last_scheduled:
+                    schedule["yt3_last_scheduled_utc"] = last_scheduled
+                    save_mc_schedule(schedule)
+                    print(f"Channel #3 queue set through {last_scheduled}")
+
+            # Reuse rendered clips for Channel #2 Morning IST slots.
+            if upload_yt2 and os.getenv("YT_REFRESH_TOKEN_2"):
+                now_ist = ist_now()
+                today_ist = now_ist.strftime("%Y-%m-%d")
+                dates = [
+                    d for d in schedule.get("yt2_morning_scheduled_dates", [])
+                    if d >= today_ist
+                ]
+
+                if now_ist.hour < 12:
+                    if yt2_count == 0:
+                        try:
+                            upload_youtube(
+                                rendered[0]["path"],
+                                rendered[0]["title"],
+                                refresh_token=os.getenv("YT_REFRESH_TOKEN_2"),
+                                channel_label="Channel #2",
+                                privacy_status="public",
+                                description=rendered[0]["description"],
+                            )
+                            increment_daily_count("yt2")
+                            uploaded_any = True
+                            if today_ist not in dates:
+                                dates.append(today_ist)
+                            print("Channel #2 Morning Minecraft upload complete (Clip 1).")
+                        except Exception as e:
+                            print(f"Channel #2 Morning upload failed: {e}")
+
+                    if len(rendered) >= 3:
+                        slot = next_morning_ist_slot(1)
+                        slot_date = slot.strftime("%Y-%m-%d")
+                        try:
+                            upload_youtube(
+                                rendered[2]["path"],
+                                rendered[2]["title"],
+                                refresh_token=os.getenv("YT_REFRESH_TOKEN_2"),
+                                channel_label="Channel #2",
+                                privacy_status="private",
+                                publish_at=to_utc_iso(slot),
+                                description=rendered[2]["description"],
+                            )
+                            uploaded_any = True
+                            if slot_date not in dates:
+                                dates.append(slot_date)
+                            print(f"Channel #2 scheduled Clip 3 for {slot_date} 09:00 IST.")
+                        except Exception as e:
+                            print(f"Channel #2 scheduled upload failed: {e}")
+
+                elif now_ist.hour >= 18 and len(rendered) >= 4:
+                    for clip_index, day_offset in ((1, 1), (3, 2)):
+                        slot = next_morning_ist_slot(day_offset)
+                        slot_date = slot.strftime("%Y-%m-%d")
+                        try:
+                            upload_youtube(
+                                rendered[clip_index]["path"],
+                                rendered[clip_index]["title"],
+                                refresh_token=os.getenv("YT_REFRESH_TOKEN_2"),
+                                channel_label="Channel #2",
+                                privacy_status="private",
+                                publish_at=to_utc_iso(slot),
+                                description=rendered[clip_index]["description"],
+                            )
+                            uploaded_any = True
+                            if slot_date not in dates:
+                                dates.append(slot_date)
+                            print(f"Channel #2 scheduled Clip {clip_index + 1} for {slot_date} 09:00 IST.")
+                        except Exception as e:
+                            print(f"Channel #2 scheduled upload failed for {slot_date}: {e}")
+
+                schedule["yt2_morning_scheduled_dates"] = sorted(set(dates))
+                save_mc_schedule(schedule)
+
+        elif upload_yt2 and os.getenv("YT_REFRESH_TOKEN_2"):
+            # Single immediate Channel #2 Minecraft upload (manual test / no Channel #3).
+            try:
+                upload_youtube(
+                    rendered[0]["path"],
+                    rendered[0]["title"],
+                    refresh_token=os.getenv("YT_REFRESH_TOKEN_2"),
+                    channel_label="Channel #2",
+                    privacy_status="public",
+                    description=rendered[0]["description"],
+                )
+                increment_daily_count("yt2")
+                uploaded_any = True
+                print("Channel #2 Minecraft upload complete (Clip 1).")
+            except Exception as e:
+                print(f"Channel #2 Minecraft upload failed: {e}")
+
+        if uploaded_any:
+            mark_processed(video["id"])
+
+        return uploaded_any
+
+    finally:
+        for path in temp_paths + [item["path"] for item in rendered]:
+            try:
+                if Path(path).exists():
+                    Path(path).unlink()
+            except Exception:
+                pass
+
+
 def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload_ig):
     clip_id = clip["id"]
     title = clip.get("title", "")
@@ -1008,8 +1721,8 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload
             mark_processed(clip_id)
             return False, False
 
-        # 3. Detect streamer webcam position (1080:680 box)
-        cam_box = detect_streamer_cam(raw_mp4)
+        # 3. Safe streamer webcam detection (None -> clean full-frame fallback)
+        cam_box = detect_facecam_safe(raw_mp4)
 
         # 4. Jump-cut silence removal & timeline remapping
         orig_dur = get_video_duration(raw_mp4)
@@ -1022,7 +1735,7 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload
         ig_caption = metadata["ig_caption"]
 
         # 6. Build hook banner text and write ASS subtitles (Hook style at y=680, Default style at MarginV=420)
-        write_ass_subtitles(remapped_words, ass_path, total_dur, hook_title, has_webcam=(cam_box is not None))
+        write_ass_subtitles(remapped_words, ass_path, total_dur, hook_title, has_webcam=bool(cam_box))
 
         # 7. Render stacked split-screen vertical video (top 1080x680 webcam, bottom 1080x1240 gameplay)
         render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box)
@@ -1086,33 +1799,12 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload
                 p.unlink()
 
 
-def main():
-    yt_count, yt2_count, ig_count = get_daily_counts()
-    print(f"Today's current upload count: YouTube={yt_count}/{MAX_YT_PER_DAY}, YouTube#2={yt2_count}/{MAX_YT2_PER_DAY}, Instagram={ig_count}/{MAX_IG_PER_DAY}")
-
-    can_upload_yt = yt_count < MAX_YT_PER_DAY
-    can_upload_yt2 = (
-        bool(os.getenv("YT_REFRESH_TOKEN_2"))
-        and yt2_count < MAX_YT2_PER_DAY
-        and is_yt2_time_window()
-    )
-    can_upload_ig = ig_count < MAX_IG_PER_DAY
-
-    if UPLOAD_TARGET == "yt2_only":
-        can_upload_yt = False
-        can_upload_ig = False
-        can_upload_yt2 = bool(os.getenv("YT_REFRESH_TOKEN_2")) and yt2_count < MAX_YT2_PER_DAY
-        print("UPLOAD_TARGET=yt2_only: Channel #1 and Instagram disabled; Channel #2 enabled regardless of IST window.")
-
-    if not can_upload_yt and not can_upload_yt2 and not can_upload_ig:
-        print(f"All daily upload caps reached for today (YouTube: {yt_count}/{MAX_YT_PER_DAY}, YouTube#2: {yt2_count}/{MAX_YT2_PER_DAY}, Instagram: {ig_count}/{MAX_IG_PER_DAY}). Exiting cleanly.")
-        return
-
+def run_gta_pipeline(can_upload_yt, can_upload_yt2, can_upload_ig):
     token = get_twitch_token()
     game_id = get_gta6_game_id(token)
     if not game_id:
         print("Grand Theft Auto VI category not found on Twitch.")
-        return
+        return False
 
     uploaded = False
     upload_attempts = 0
@@ -1174,7 +1866,7 @@ def main():
 
                 if upload_attempts >= MAX_UPLOAD_ATTEMPTS_PER_RUN:
                     print("Reached max upload attempts for this run. Exiting cleanly.")
-                    return
+                    return uploaded
 
             if uploaded:
                 break
@@ -1227,7 +1919,7 @@ def main():
 
                 if upload_attempts >= MAX_UPLOAD_ATTEMPTS_PER_RUN:
                     print("Reached max upload attempts for this run. Exiting cleanly.")
-                    return
+                    return uploaded
 
             if uploaded:
                 break
@@ -1236,6 +1928,99 @@ def main():
 
     if not uploaded:
         print("No valid GTA VI clips found across all progressive fallback windows.")
+    return uploaded
+
+
+def main():
+    schedule = load_mc_schedule()
+    yt_count, yt2_count, ig_count = get_daily_counts()
+
+    now_ist = ist_now()
+    today_ist = now_ist.strftime("%Y-%m-%d")
+    is_morning = now_ist.hour < 12
+    is_night = now_ist.hour >= 18
+
+    has_yt2 = bool(os.getenv("YT_REFRESH_TOKEN_2", "").strip())
+    has_yt3 = bool(os.getenv("YT_REFRESH_TOKEN_3", "").strip())
+
+    print(f"Today's current upload count: YouTube={yt_count}/{MAX_YT_PER_DAY}, YouTube#2={yt2_count}/{MAX_YT2_PER_DAY}, Instagram={ig_count}/{MAX_IG_PER_DAY}")
+    print(f"Current IST time: {now_ist.strftime('%Y-%m-%d %H:%M')} | UPLOAD_TARGET={UPLOAD_TARGET}")
+
+    yt3_resting = UPLOAD_TARGET == "all" and yt3_queue_is_resting(schedule)
+    yt2_morning_covered = is_morning and today_ist in schedule.get("yt2_morning_scheduled_dates", [])
+
+    can_upload_yt = yt_count < MAX_YT_PER_DAY
+    can_upload_yt2 = has_yt2 and yt2_count < MAX_YT2_PER_DAY and is_night
+    can_upload_ig = ig_count < MAX_IG_PER_DAY
+    run_yt3 = False
+    run_yt2_mc = False
+
+    if UPLOAD_TARGET == "yt3_only":
+        can_upload_yt = False
+        can_upload_yt2 = False
+        can_upload_ig = False
+        run_yt3 = has_yt3
+        print("UPLOAD_TARGET=yt3_only: forcing Channel #3 Minecraft batch; Channels #1/#2 and Instagram disabled.")
+        if not has_yt3:
+            print("YT_REFRESH_TOKEN_3 is not set. Nothing to do.")
+            return
+    elif UPLOAD_TARGET == "yt2_only":
+        can_upload_yt = False
+        can_upload_ig = False
+        can_upload_yt2 = has_yt2 and yt2_count < MAX_YT2_PER_DAY and not is_morning
+        run_yt2_mc = has_yt2 and yt2_count < MAX_YT2_PER_DAY and is_morning
+        print("UPLOAD_TARGET=yt2_only: Channel #2 only (Minecraft in Morning IST, GTA 6 otherwise).")
+        if not has_yt2:
+            print("YT_REFRESH_TOKEN_2 is not set. Nothing to do.")
+            return
+    else:
+        run_yt3 = has_yt3 and not yt3_resting
+        if is_morning:
+            if yt2_morning_covered:
+                print("Channel #2 Morning Minecraft slot is already scheduled. Skipping Minecraft for Channel #2.")
+            else:
+                # Channel #3 may be resting on its queue, but Channel #2 still needs
+                # its Morning Minecraft clip, so allow a Channel #2-only render.
+                run_yt2_mc = has_yt2 and yt2_count < MAX_YT2_PER_DAY
+        elif is_night:
+            # Night batch reuses rendered clips for upcoming Channel #2 Morning slots.
+            run_yt2_mc = has_yt2 and run_yt3
+        if yt3_resting:
+            print(f"Channel #3 queue is still scheduled through {schedule.get('yt3_last_scheduled_utc')}. Channel #3 rests this run.")
+        elif not has_yt3:
+            print("YT_REFRESH_TOKEN_3 is not set. Channel #3 Minecraft scheduling disabled.")
+
+    gta_needed = can_upload_yt or can_upload_yt2 or can_upload_ig
+
+    if not gta_needed and not run_yt3 and not run_yt2_mc:
+        print("No eligible upload targets for this run. Exiting cleanly.")
+        return
+
+    mc_uploaded = False
+    if run_yt3 or run_yt2_mc:
+        clip_count = 4 if run_yt3 else 1
+        print(f"\n=== Minecraft Batch: rendering {clip_count} clip(s) ===")
+        try:
+            mc_uploaded = run_minecraft_batch(
+                schedule,
+                clip_count=clip_count,
+                upload_yt3=run_yt3,
+                upload_yt2=run_yt2_mc,
+                yt2_count=yt2_count,
+            )
+        except Exception as e:
+            print(f"Minecraft batch failed: {e}")
+
+    gta_uploaded = False
+    if gta_needed:
+        print("\n=== GTA 6 Twitch Pipeline ===")
+        try:
+            gta_uploaded = run_gta_pipeline(can_upload_yt, can_upload_yt2, can_upload_ig)
+        except Exception as e:
+            print(f"GTA pipeline failed: {e}")
+
+    if not mc_uploaded and not gta_uploaded:
+        print("No uploads completed this run.")
 
 
 if __name__ == "__main__":
