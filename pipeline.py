@@ -27,6 +27,7 @@ PROCESSED_FILE = Path("processed.txt")
 PROCESSED = set(PROCESSED_FILE.read_text().splitlines()) if PROCESSED_FILE.exists() else set()
 
 MAX_YT_PER_DAY = 1  # 1 YouTube Short per UTC day
+MAX_YT2_PER_DAY = 2  # 2 YouTube Shorts for Channel #2 per UTC day (Morning and Night IST runs)
 MAX_IG_PER_DAY = 3  # Up to 3 Instagram Reels per UTC day (Morning, Noon, Night)
 MAX_UPLOAD_ATTEMPTS_PER_RUN = 3  # Max candidate clips to render/attempt per single CI run
 FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Progressive fallback windows
@@ -39,7 +40,9 @@ PRIORITY_STREAMERS = [
 BLOCKED_KEYWORDS = [
     "strip", "stripclub", "club", "nsfw", "nude", "nudity", "naked",
     "18+", "xxx", "porn", "hentai", "boobs", "booty", "lapdance",
-    "unicorn", "vanilla"
+    "unicorn", "vanilla", "bikini", "beach", "swimsuit", "lingerie",
+    "underwear", "changing", "clothes", "outfit", "gyatt", "thicc",
+    "baddie", "stripper",
 ]
 
 EXPOSED_SENSITIVE_CLASSES = {
@@ -48,6 +51,11 @@ EXPOSED_SENSITIVE_CLASSES = {
     "MALE_GENITALIA_EXPOSED",
     "BUTTOCKS_EXPOSED",
     "ANUS_EXPOSED",
+}
+
+COVERED_SENSITIVE_CLASSES = {
+    "FEMALE_BREAST_COVERED",
+    "BUTTOCKS_COVERED",
 }
 
 
@@ -80,7 +88,7 @@ def contains_nsfw(video_path):
         frame_pattern = os.path.join(temp_dir, "frame_%04d.jpg")
         cmd = [
             "ffmpeg", "-y", "-i", str(video_path),
-            "-vf", "fps=1",
+            "-vf", "fps=3",
             "-q:v", "2",
             frame_pattern
         ]
@@ -96,7 +104,10 @@ def contains_nsfw(video_path):
             for d in detections:
                 label = d.get("class")
                 score = d.get("score", 0.0)
-                if label in EXPOSED_SENSITIVE_CLASSES and score >= 0.45:
+                if label in EXPOSED_SENSITIVE_CLASSES and score >= 0.28:
+                    print(f"NSFW detected in frame {frame.name}: {label} ({score:.2f})")
+                    return True
+                if label in COVERED_SENSITIVE_CLASSES and score >= 0.55:
                     print(f"NSFW detected in frame {frame.name}: {label} ({score:.2f})")
                     return True
         return False
@@ -265,33 +276,40 @@ def detect_streamer_cam(video_path):
 
 def get_daily_counts():
     """
-    Reads daily_count.txt supporting both:
-    - 'YYYY-MM-DD:yt=X,ig=Y'
-    - 'YYYY-MM-DD:X' (legacy format treated as yt=X, ig=0)
-    Returns (yt_count, ig_count) for today's UTC date.
+    Reads daily_count.txt supporting:
+    - 'YYYY-MM-DD:yt=X,yt2=Z,ig=Y'
+    - 'YYYY-MM-DD:yt=X,ig=Y' (yt2 defaults to 0)
+    - 'YYYY-MM-DD:X' (legacy format treated as yt=X, yt2=0, ig=0)
+    Returns (yt_count, yt2_count, ig_count) for today's UTC date.
     """
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     count_file = Path("daily_count.txt")
     if not count_file.exists():
-        return 0, 0
+        return 0, 0, 0
 
     content = count_file.read_text().strip()
     if ":" not in content:
-        return 0, 0
+        return 0, 0, 0
 
     saved_date, counts_part = content.split(":", 1)
     if saved_date != today_str:
-        return 0, 0
+        return 0, 0, 0
 
     yt_count = 0
+    yt2_count = 0
     ig_count = 0
 
-    if "yt=" in counts_part or "ig=" in counts_part:
+    if "yt=" in counts_part or "yt2=" in counts_part or "ig=" in counts_part:
         for item in counts_part.split(","):
             item = item.strip()
             if item.startswith("yt="):
                 try:
                     yt_count = int(item.split("=")[1])
+                except ValueError:
+                    pass
+            elif item.startswith("yt2="):
+                try:
+                    yt2_count = int(item.split("=")[1])
                 except ValueError:
                     pass
             elif item.startswith("ig="):
@@ -306,24 +324,35 @@ def get_daily_counts():
         except ValueError:
             pass
 
-    return yt_count, ig_count
+    return yt_count, yt2_count, ig_count
 
 
 def increment_daily_count(platform):
     """
-    Increments 'yt' or 'ig' counter for today's UTC date.
+    Increments 'yt', 'yt2', or 'ig' counter for today's UTC date.
     """
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    yt_count, ig_count = get_daily_counts()
+    yt_count, yt2_count, ig_count = get_daily_counts()
 
     if platform == "yt":
         yt_count += 1
+    elif platform == "yt2":
+        yt2_count += 1
     elif platform == "ig":
         ig_count += 1
 
     count_file = Path("daily_count.txt")
-    count_file.write_text(f"{today_str}:yt={yt_count},ig={ig_count}", encoding="utf-8")
-    print(f"Updated daily count for {today_str}: yt={yt_count}, ig={ig_count}")
+    count_file.write_text(f"{today_str}:yt={yt_count},yt2={yt2_count},ig={ig_count}", encoding="utf-8")
+    print(f"Updated daily count for {today_str}: yt={yt_count}, yt2={yt2_count}, ig={ig_count}")
+
+
+def is_yt2_time_window():
+    """
+    Channel #2 uploads only run on the Morning (< 12:00 IST) and Night (>= 18:00 IST)
+    runs. The Noon (12:00-17:59 IST) run is skipped.
+    """
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    return now_ist.hour < 12 or now_ist.hour >= 18
 
 
 def get_twitch_token():
@@ -558,8 +587,8 @@ def fallback_metadata(broadcaster, raw_title):
 def generate_ai_metadata(broadcaster, raw_title, transcript):
     """
     Calls Google AI Studio Gemini API (google-genai SDK) to generate viral
-    hook_title, yt_title, and ig_caption. Tries gemini-3.8-flash first,
-    then falls back to gemini-2.5-flash. If both fail, uses fallback_metadata().
+    hook_title, yt_title, and ig_caption. Tries gemini-2.5-flash first,
+    then falls back to gemini-3.8-flash. If both fail, uses fallback_metadata().
     Uses v1beta API version to support JSON mode and newer endpoints cleanly.
     """
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -585,7 +614,7 @@ def generate_ai_metadata(broadcaster, raw_title, transcript):
         f"Return ONLY the raw JSON object, without markdown formatting or code blocks."
     )
 
-    models_to_try = ["gemini-3.8-flash", "gemini-2.5-flash"]
+    models_to_try = ["gemini-2.5-flash", "gemini-3.8-flash"]
 
     for model_name in models_to_try:
         try:
@@ -757,10 +786,11 @@ def render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def upload_youtube(video_path, title):
+def upload_youtube(video_path, title, refresh_token=None, channel_label="Primary"):
+    refresh_token = refresh_token or os.getenv("YT_REFRESH_TOKEN")
     creds = Credentials(
         token=None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"],
+        refresh_token=refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=os.environ["YT_CLIENT_ID"],
         client_secret=os.environ["YT_CLIENT_SECRET"],
@@ -780,7 +810,7 @@ def upload_youtube(video_path, title):
     media = MediaFileUpload(str(video_path), mimetype="video/mp4", resumable=True)
     req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     resp = req.execute()
-    print("Uploaded YouTube Video ID:", resp["id"])
+    print(f"Uploaded YouTube Video ID ({channel_label}):", resp["id"])
 
 
 def upload_instagram_reel(video_path, ig_caption, clip_id):
@@ -949,7 +979,7 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
             print(f"Failed to delete tag {tag_name}: {e}")
 
 
-def process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
+def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload_ig):
     clip_id = clip["id"]
     title = clip.get("title", "")
     broadcaster = clip.get("broadcaster_name", "")
@@ -1000,11 +1030,11 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
         attempted_upload = True
         any_upload_succeeded = False
 
-        # 8. Upload to YouTube (if within daily limit)
+        # 8. Upload to YouTube Channel #1 (if within daily limit)
         if can_upload_yt:
             try:
-                print("Uploading to YouTube Shorts...")
-                upload_youtube(out_mp4, yt_title)
+                print("Uploading to YouTube Shorts (Primary channel)...")
+                upload_youtube(out_mp4, yt_title, channel_label="Primary")
                 increment_daily_count("yt")
                 any_upload_succeeded = True
             except Exception as e:
@@ -1012,7 +1042,24 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
         else:
             print("YouTube daily limit reached for today. Skipping YouTube upload.")
 
-        # 9. Upload to Instagram Reels (if within daily limit)
+        # 9. Upload the exact same rendered Short to YouTube Channel #2 (Morning/Night IST runs only)
+        if can_upload_yt2:
+            try:
+                print("Uploading to YouTube Shorts (Channel #2)...")
+                upload_youtube(
+                    out_mp4,
+                    yt_title,
+                    refresh_token=os.getenv("YT_REFRESH_TOKEN_2"),
+                    channel_label="Channel #2",
+                )
+                increment_daily_count("yt2")
+                any_upload_succeeded = True
+            except Exception as e:
+                print(f"YouTube Channel #2 upload failed: {e}")
+        else:
+            print("YouTube Channel #2 not eligible (token missing, daily cap reached, or outside IST window). Skipping.")
+
+        # 10. Upload to Instagram Reels (if within daily limit)
         if can_upload_ig:
             try:
                 print("Uploading to Instagram Reels...")
@@ -1039,14 +1086,19 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_ig):
 
 
 def main():
-    yt_count, ig_count = get_daily_counts()
-    print(f"Today's current upload count: YouTube={yt_count}/{MAX_YT_PER_DAY}, Instagram={ig_count}/{MAX_IG_PER_DAY}")
+    yt_count, yt2_count, ig_count = get_daily_counts()
+    print(f"Today's current upload count: YouTube={yt_count}/{MAX_YT_PER_DAY}, YouTube#2={yt2_count}/{MAX_YT2_PER_DAY}, Instagram={ig_count}/{MAX_IG_PER_DAY}")
 
     can_upload_yt = yt_count < MAX_YT_PER_DAY
+    can_upload_yt2 = (
+        bool(os.getenv("YT_REFRESH_TOKEN_2"))
+        and yt2_count < MAX_YT2_PER_DAY
+        and is_yt2_time_window()
+    )
     can_upload_ig = ig_count < MAX_IG_PER_DAY
 
-    if not can_upload_yt and not can_upload_ig:
-        print(f"All daily upload caps reached for today (YouTube: {yt_count}/{MAX_YT_PER_DAY}, Instagram: {ig_count}/{MAX_IG_PER_DAY}). Exiting cleanly.")
+    if not can_upload_yt and not can_upload_yt2 and not can_upload_ig:
+        print(f"All daily upload caps reached for today (YouTube: {yt_count}/{MAX_YT_PER_DAY}, YouTube#2: {yt2_count}/{MAX_YT2_PER_DAY}, Instagram: {ig_count}/{MAX_IG_PER_DAY}). Exiting cleanly.")
         return
 
     token = get_twitch_token()
@@ -1104,7 +1156,7 @@ def main():
                     mark_processed(clip_id)
                     continue
 
-                success, attempted = process_and_upload_candidate(clip, can_upload_yt, can_upload_ig)
+                success, attempted = process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload_ig)
                 if attempted:
                     upload_attempts += 1
 
@@ -1157,7 +1209,7 @@ def main():
                     continue
 
                 # Process candidate and upload to eligible platforms
-                success, attempted = process_and_upload_candidate(clip, can_upload_yt, can_upload_ig)
+                success, attempted = process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload_ig)
                 if attempted:
                     upload_attempts += 1
 
