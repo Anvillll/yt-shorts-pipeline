@@ -31,6 +31,7 @@ MAX_YT2_PER_DAY = 2  # 2 YouTube Shorts for Channel #2 per UTC day (Morning and 
 MAX_IG_PER_DAY = 3  # Up to 3 Instagram Reels per UTC day (Morning, Noon, Night)
 MAX_UPLOAD_ATTEMPTS_PER_RUN = 3  # Max candidate clips to render/attempt per single CI run
 FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Progressive fallback windows
+UPLOAD_TARGET = os.getenv("UPLOAD_TARGET", "all").strip().lower()
 
 PRIORITY_STREAMERS = [
     "kaicenat", "ishowspeed", "xqc", "caseoh_", "jynxzi",
@@ -1096,6 +1097,12 @@ def main():
         and is_yt2_time_window()
     )
     can_upload_ig = ig_count < MAX_IG_PER_DAY
+
+    if UPLOAD_TARGET == "yt2_only":
+        can_upload_yt = False
+        can_upload_ig = False
+        can_upload_yt2 = bool(os.getenv("YT_REFRESH_TOKEN_2")) and yt2_count < MAX_YT2_PER_DAY
+        print("UPLOAD_TARGET=yt2_only: Channel #1 and Instagram disabled; Channel #2 enabled regardless of IST window.")
 
     if not can_upload_yt and not can_upload_yt2 and not can_upload_ig:
         print(f"All daily upload caps reached for today (YouTube: {yt_count}/{MAX_YT_PER_DAY}, YouTube#2: {yt2_count}/{MAX_YT2_PER_DAY}, Instagram: {ig_count}/{MAX_IG_PER_DAY}). Exiting cleanly.")

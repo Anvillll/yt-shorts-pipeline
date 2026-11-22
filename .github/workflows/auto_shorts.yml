@@ -2,6 +2,15 @@ name: Auto GTA VI Shorts Pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'Upload target (all or yt2_only)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - yt2_only
 
 permissions:
   contents: write
@@ -38,6 +47,7 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_REFRESH_TOKEN_2: ${{ secrets.YT_REFRESH_TOKEN_2 }}
           PYTHONUNBUFFERED: "1"
+          UPLOAD_TARGET: ${{ github.event.inputs.target || 'all' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
