@@ -1,4 +1,3 @@
-import atexit
 import json
 import os
 import re
@@ -36,10 +35,9 @@ FALLBACK_HOURS = [24, 48, 72, 168, 720]  # Progressive fallback windows
 UPLOAD_TARGET = os.getenv("UPLOAD_TARGET", "all").strip().lower()
 IST = timezone(timedelta(hours=5, minutes=30))
 MC_SCHEDULE_FILE = Path("mc_schedule.json")
-COOKIES_FILE = Path("cookies.txt")
-_COOKIES_CREATED_FROM_ENV = False
 
-MINECRAFT_CREATORS = ["@whereswrld", "@wemmbumc", "@DrDonutt", "@aCookieGod"]
+MINECRAFT_TWITCH_CREATORS = ["whereswrld", "wemmbumc", "drdonutt", "acookiegod"]
+MINECRAFT_GAME_ID = "27471"
 
 PRIORITY_STREAMERS = [
     "kaicenat", "ishowspeed", "xqc", "caseoh_", "jynxzi",
@@ -484,324 +482,6 @@ def to_utc_iso(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _remove_runtime_cookies():
-    if not _COOKIES_CREATED_FROM_ENV:
-        return
-    try:
-        if COOKIES_FILE.exists():
-            COOKIES_FILE.unlink()
-            print("Removed runtime cookies.txt.")
-    except Exception as e:
-        print(f"Warning: Could not remove cookies.txt: {e}")
-
-
-def _ensure_cookies_file():
-    global _COOKIES_CREATED_FROM_ENV
-    if COOKIES_FILE.exists():
-        return
-    data = os.getenv("YT_COOKIES", "")
-    if not data.strip():
-        return
-    try:
-        COOKIES_FILE.write_text(
-            data if data.endswith("\n") else data + "\n",
-            encoding="utf-8",
-        )
-        _COOKIES_CREATED_FROM_ENV = True
-        atexit.register(_remove_runtime_cookies)
-        print("Created cookies.txt from YT_COOKIES secret.")
-    except Exception as e:
-        print(f"Warning: Could not create cookies.txt: {e}")
-
-
-_YTDLP_SUPPORTS_REMOTE_COMPONENTS = None
-
-
-def _ytdlp_supports_remote_components():
-    global _YTDLP_SUPPORTS_REMOTE_COMPONENTS
-    if _YTDLP_SUPPORTS_REMOTE_COMPONENTS is None:
-        try:
-            res = subprocess.run(
-                ["yt-dlp", "--help"],
-                capture_output=True, text=True, timeout=30
-            )
-            _YTDLP_SUPPORTS_REMOTE_COMPONENTS = "--remote-components" in (
-                res.stdout + res.stderr
-            )
-        except Exception:
-            _YTDLP_SUPPORTS_REMOTE_COMPONENTS = False
-    return _YTDLP_SUPPORTS_REMOTE_COMPONENTS
-
-
-def _youtube_auth_args(url):
-    if not url or ("youtube.com" not in url and "youtu.be" not in url):
-        return []
-    args = [
-        "--extractor-args", "youtube:player_client=mweb,web",
-        "--js-runtimes", "node",
-    ]
-    if _ytdlp_supports_remote_components():
-        args += ["--remote-components", "ejs:github"]
-    try:
-        if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
-            args = ["--cookies", str(COOKIES_FILE), "--sleep-requests", "1", *args]
-    except Exception as e:
-        print(f"Warning: Could not check cookies.txt: {e}")
-    return args
-
-
-_ensure_cookies_file()
-
-
-def _yt_dlp_json(args, timeout=180):
-    url = next(
-        (
-            arg for arg in args
-            if isinstance(arg, str) and ("youtube.com" in arg or "youtu.be" in arg)
-        ),
-        "",
-    )
-    auth_args = _youtube_auth_args(url)
-    try:
-        res = subprocess.run(
-            ["yt-dlp", "--no-warnings", *auth_args, *args],
-            capture_output=True, text=True, timeout=timeout
-        )
-        if res.returncode != 0:
-            print(f"yt-dlp failed: {res.stderr.strip()[:300]}")
-            return None
-        return json.loads(res.stdout)
-    except Exception as e:
-        print(f"yt-dlp error: {e}")
-        return None
-
-
-def _parse_upload_ts(entry):
-    ts = entry.get("timestamp") or entry.get("release_timestamp")
-    if isinstance(ts, (int, float)):
-        try:
-            return datetime.fromtimestamp(ts, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return None
-    upload_date = entry.get("upload_date")
-    if upload_date:
-        try:
-            return datetime.strptime(str(upload_date), "%Y%m%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
-    return None
-
-
-def select_minecraft_video(processed_ids):
-    """
-    Select a long-form Minecraft video using strict creator priority order.
-    Uses yt-dlp flat playlist extraction (latest 6 videos per creator).
-    Filters out Shorts (< 180s) and videos already present in processed.txt.
-    Pass 1: first creator (priority order) with an unused video from the last 7
-    days -> highest view_count. Pass 2: first creator with any unused long-form
-    video -> most recent.
-    """
-    recent_cutoff = utc_now() - timedelta(days=7)
-    creator_candidates = []
-
-    for handle in MINECRAFT_CREATORS:
-        url = f"https://www.youtube.com/{handle}/videos"
-        data = _yt_dlp_json(["--flat-playlist", "--dump-single-json", "--playlist-end", "6", url])
-        entries = (data or {}).get("entries") or []
-        candidates = []
-        for entry in entries[:6]:
-            if not isinstance(entry, dict):
-                continue
-            video_id = entry.get("id")
-            duration = entry.get("duration")
-            if not video_id or video_id in processed_ids:
-                continue
-            if duration is not None and duration < 180:
-                continue
-            entry_url = entry.get("url") or ""
-            if not entry_url.startswith("http"):
-                entry_url = f"https://www.youtube.com/watch?v={video_id}"
-            candidates.append({
-                "id": video_id,
-                "url": entry_url,
-                "title": entry.get("title") or "",
-                "duration": duration,
-                "view_count": entry.get("view_count") or 0,
-                "timestamp": _parse_upload_ts(entry),
-                "creator": handle,
-            })
-        creator_candidates.append((handle, candidates))
-
-    for handle, candidates in creator_candidates:
-        recent = [
-            c for c in candidates
-            if c["timestamp"] is not None and c["timestamp"] >= recent_cutoff
-        ]
-        if recent:
-            pick = max(recent, key=lambda c: c["view_count"])
-            print(f"Minecraft selection: {handle} -> {pick['id']} (recent, {pick['view_count']} views)")
-            return pick
-
-    for handle, candidates in creator_candidates:
-        if candidates:
-            dated = [c for c in candidates if c["timestamp"] is not None]
-            pick = max(dated, key=lambda c: c["timestamp"]) if dated else candidates[0]
-            print(f"Minecraft selection (fallback): {handle} -> {pick['id']}")
-            return pick
-
-    print("No unused Minecraft long-form videos found for any priority creator.")
-    return None
-
-
-def fetch_video_details(video_url):
-    data = _yt_dlp_json(["--skip-download", "-J", "--no-playlist", video_url])
-    return data or {}
-
-
-def _gemini_pick_windows(title, description, duration, need):
-    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not gemini_key or not genai or need <= 0:
-        return []
-
-    prompt = (
-        "You are selecting highlight windows from a Minecraft YouTube video.\n"
-        f"Video title: {title}\n"
-        f"Video description: {description[:3000]}\n"
-        f"Total duration: {duration:.1f} seconds.\n"
-        f"Pick exactly {need} non-overlapping highlight windows, each 45-58 seconds long, "
-        "that are likely the most engaging, funny, or intense moments.\n"
-        'Return ONLY raw JSON: {"windows": [{"start_sec": 0.0, "end_sec": 50.0}]}\n'
-    )
-
-    for model_name in ["gemini-2.5-flash", "gemini-3.8-flash"]:
-        try:
-            client = genai.Client(api_key=gemini_key, http_options={"api_version": "v1beta"})
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json")
-            )
-            data = json.loads(response.text.strip())
-            windows = []
-            for item in data.get("windows") or []:
-                start = float(item.get("start_sec", 0))
-                end = float(item.get("end_sec", 0))
-                if 0 <= start < end <= duration and 45 <= (end - start) <= 58:
-                    windows.append((start, end))
-            if windows:
-                print(f"Gemini ({model_name}) selected {len(windows)} Minecraft windows.")
-                return windows
-        except Exception as e:
-            print(f"Gemini window selection {model_name} failed: {type(e).__name__}: {e}")
-    return []
-
-
-def pick_minecraft_windows(video_info, count=4):
-    duration = float(video_info.get("duration") or 0)
-    if duration <= 0:
-        return []
-
-    win = 52.0
-    max_fit = (duration / max(1, count)) - 2.0
-    if max_fit < win:
-        win = max(45.0, max_fit)
-
-    if duration < 45:
-        return [(0.0, max(10.0, duration))]
-
-    windows = []
-    heatmap = video_info.get("heatmap") or []
-
-    scored = []
-    if heatmap:
-        points = []
-        for seg in heatmap:
-            try:
-                start = float(seg.get("start_time", 0))
-                end = float(seg.get("end_time", start))
-                value = float(seg.get("value", 0))
-            except (TypeError, ValueError):
-                continue
-            if end > start:
-                points.append((start, end, value))
-        if points:
-            t = 0.0
-            while t + win <= duration + 0.01:
-                score = 0.0
-                for start, end, value in points:
-                    overlap = max(0.0, min(t + win, end) - max(t, start))
-                    if overlap > 0:
-                        score += value * overlap
-                scored.append((score, t))
-                t += 5.0
-    if scored:
-        scored.sort(key=lambda item: item[0], reverse=True)
-        for _, start in scored:
-            end = min(duration, start + win)
-            if end - start < 45:
-                continue
-            if all(end <= s or start >= e for s, e in windows):
-                windows.append((start, end))
-            if len(windows) >= count:
-                break
-
-    if len(windows) < count:
-        need = count - len(windows)
-        for start, end in _gemini_pick_windows(
-            video_info.get("title") or "",
-            video_info.get("description") or "",
-            duration,
-            need,
-        ):
-            if all(end <= s or start >= e for s, e in windows):
-                windows.append((start, end))
-            if len(windows) >= count:
-                break
-
-    if len(windows) < count:
-        span = duration / count
-        for i in range(count):
-            start = max(0.0, i * span + max(0.0, (span - win) / 2.0))
-            end = min(duration, start + win)
-            if end - start < 45:
-                continue
-            if all(end <= s or start >= e for s, e in windows):
-                windows.append((start, end))
-            if len(windows) >= count:
-                break
-
-    print(f"Minecraft windows selected: {[(round(s, 1), round(e, 1)) for s, e in windows[:count]]}")
-    return windows[:count]
-
-
-def download_minecraft_source(video_url, out_path):
-    cmd = [
-        "yt-dlp", "--no-warnings", "--no-playlist",
-        *_youtube_auth_args(video_url),
-        "-f", "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
-        "--merge-output-format", "mp4",
-        "-o", str(out_path),
-        video_url,
-    ]
-    subprocess.run(cmd, check=True)
-
-
-def slice_video_local(source_path, start_sec, end_sec, out_path):
-    duration = max(0.0, end_sec - start_sec)
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", f"{start_sec:.3f}",
-        "-i", str(source_path),
-        "-t", f"{duration:.3f}",
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "20",
-        "-c:a", "aac",
-        str(out_path),
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-
 def _clean_hook(raw):
     raw_hook = (raw or "").strip().upper()
     hook_title = raw_hook.replace("\\n", "\n").replace("|", "\n")
@@ -956,6 +636,142 @@ def fetch_clips_for_window(token, game_id, hours):
     r.raise_for_status()
     clips = sorted(r.json().get("data", []), key=lambda c: c.get("view_count", 0), reverse=True)
     return clips
+
+
+def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
+    """
+    Select unused Minecraft Twitch clips. Creator priority is strict:
+    whereswrld -> wemmbumc -> drdonutt -> acookiegod, each tried over the last
+    7 days and then 30 days. If still short, top up from the Minecraft category
+    (English only, last 7 days) by highest view_count.
+    """
+    headers = {
+        "Client-ID": os.environ["TWITCH_CLIENT_ID"],
+        "Authorization": f"Bearer {twitch_token}",
+    }
+
+    try:
+        users_resp = requests.get(
+            "https://api.twitch.tv/helix/users",
+            headers=headers,
+            params=[("login", login) for login in MINECRAFT_TWITCH_CREATORS],
+            timeout=15,
+        )
+        users_resp.raise_for_status()
+        users = users_resp.json().get("data", [])
+    except Exception as e:
+        print(f"Twitch user lookup failed for Minecraft creators: {e}")
+        users = []
+
+    id_by_login = {
+        str(user.get("login", "")).lower(): user.get("id")
+        for user in users
+        if user.get("id")
+    }
+    creator_ids = [
+        (login, id_by_login[login])
+        for login in MINECRAFT_TWITCH_CREATORS
+        if login in id_by_login
+    ]
+    missing = [login for login in MINECRAFT_TWITCH_CREATORS if login not in id_by_login]
+    if missing:
+        print(f"Minecraft creators not found on Twitch: {', '.join(missing)}")
+
+    selected = []
+    seen = set()
+
+    def add_clips(clips, creator_name=""):
+        for clip in sorted(clips, key=lambda c: c.get("view_count") or 0, reverse=True):
+            clip_id = clip.get("id")
+            if not clip_id or clip_id in processed_ids or clip_id in seen:
+                continue
+            try:
+                duration = float(clip.get("duration") or 0)
+            except (TypeError, ValueError):
+                continue
+            if duration < 15:
+                continue
+            if creator_name and not clip.get("creator"):
+                clip["creator"] = creator_name
+            seen.add(clip_id)
+            selected.append(clip)
+            if len(selected) >= needed_count:
+                return
+
+    def fetch_broadcaster(broadcaster_id, days):
+        started_at = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp = requests.get(
+            "https://api.twitch.tv/helix/clips",
+            headers=headers,
+            params={
+                "broadcaster_id": broadcaster_id,
+                "first": 20,
+                "started_at": started_at,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+
+    for login, broadcaster_id in creator_ids:
+        if len(selected) >= needed_count:
+            break
+        for days in (7, 30):
+            if len(selected) >= needed_count:
+                break
+            try:
+                clips = fetch_broadcaster(broadcaster_id, days)
+            except Exception as e:
+                print(f"Twitch clips fetch failed for {login} ({days}d): {e}")
+                continue
+            before = len(selected)
+            add_clips(clips, creator_name=login)
+            print(f"Minecraft creator {login} ({days}d): +{len(selected) - before} clip(s)")
+            if len(selected) >= needed_count:
+                break
+
+    if len(selected) < needed_count:
+        started_at = (
+            datetime.now(timezone.utc) - timedelta(days=7)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            resp = requests.get(
+                "https://api.twitch.tv/helix/clips",
+                headers=headers,
+                params={
+                    "game_id": MINECRAFT_GAME_ID,
+                    "first": 30,
+                    "started_at": started_at,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            category_clips = resp.json().get("data", [])
+        except Exception as e:
+            print(f"Twitch Minecraft category fallback failed: {e}")
+            category_clips = []
+        english_clips = [
+            clip for clip in category_clips
+            if str(clip.get("language", "")).lower() == "en"
+        ]
+        before = len(selected)
+        add_clips(english_clips)
+        print(f"Minecraft category fallback (7d, English): +{len(selected) - before} clip(s)")
+
+    for clip in selected[:needed_count]:
+        creator = (
+            clip.get("creator")
+            or clip.get("broadcaster_name")
+            or clip.get("creator_name")
+            or "unknown"
+        )
+        print(
+            f"Minecraft Twitch clip: {clip.get('id')} by {creator} "
+            f"({clip.get('view_count') or 0} views, {clip.get('duration') or 0}s)"
+        )
+    return selected[:needed_count]
 
 
 def format_ass_time(sec):
@@ -1551,99 +1367,82 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
 
 def run_minecraft_batch(schedule, clip_count=4, upload_yt3=True, upload_yt2=False, yt2_count=0):
     """
-    Select, render, and distribute a Minecraft batch without any NSFW scan.
-    Channel #3 receives Clip 1 public + Clips 2-4 scheduled (private/publishAt).
-    When upload_yt2 is set, reuse rendered clips for upcoming Channel #2 Morning
-    IST slots (no re-rendering).
+    Select, render, and distribute a Minecraft batch from Twitch clips without
+    any NSFW scan. Channel #3 receives Clip 1 public + Clips 2-4 scheduled
+    (private/publishAt). When upload_yt2 is set, reuse rendered clips for
+    upcoming Channel #2 Morning IST slots (no re-rendering).
     """
-    video = select_minecraft_video(PROCESSED)
-    if not video:
+    try:
+        twitch_token = get_twitch_token()
+    except Exception as e:
+        print(f"Could not get Twitch token for Minecraft batch: {e}")
         return False
 
-    print(f"Selected Minecraft video: {video['id']} - '{video['title']}' ({video['creator']})")
-    info = fetch_video_details(video["url"])
-    if info:
-        video["title"] = info.get("title") or video["title"]
-        video["duration"] = info.get("duration") or video.get("duration")
-        video["creator"] = info.get("uploader") or video.get("creator")
-        video["view_count"] = info.get("view_count") or video.get("view_count")
-    if not info:
-        info = {}
-    info.setdefault("duration", video.get("duration") or 0)
-
-    duration = float(video.get("duration") or info.get("duration") or 0)
-    if duration and duration < 180:
-        print(f"Minecraft video {video['id']} is a Short (<180s). Marking processed and skipping.")
-        mark_processed(video["id"])
+    clips = fetch_minecraft_twitch_clips(twitch_token, PROCESSED, needed_count=clip_count)
+    if not clips:
+        print("No unused Minecraft Twitch clips found. Skipping batch.")
         return False
 
-    windows = pick_minecraft_windows(info, count=clip_count)
-    if not windows:
-        print("Could not select Minecraft clip windows. Skipping batch.")
-        return False
-
-    source_path = Path(f"mc_{video['id']}_source.mp4")
     rendered = []
     temp_paths = []
     uploaded_any = False
 
     try:
-        try:
-            print(f"Downloading Minecraft source once: {video['url']}")
-            download_minecraft_source(video["url"], source_path)
+        for i, clip in enumerate(clips):
+            clip_id = clip["id"]
+            raw_path = Path(f"mc_{clip_id}_raw.mp4")
+            ass_path = Path(f"mc_{clip_id}.ass")
+            out_path = Path(f"mc_{clip_id}_short.mp4")
+            temp_paths.extend([raw_path, ass_path])
 
-            for i, (start_sec, end_sec) in enumerate(windows):
-                slice_path = Path(f"mc_{video['id']}_{i + 1}_slice.mp4")
-                ass_path = Path(f"mc_{video['id']}_{i + 1}.ass")
-                out_path = Path(f"mc_{video['id']}_{i + 1}_short.mp4")
-                temp_paths.extend([slice_path, ass_path])
-
-                try:
-                    print(f"Slicing Minecraft clip {i + 1}/{len(windows)}: {start_sec:.1f}-{end_sec:.1f}s")
-                    slice_video_local(source_path, start_sec, end_sec, slice_path)
-                    dur = get_video_duration(slice_path)
-
-                    words, _info, transcript = transcribe_and_verify(slice_path)
-                    if words is None:
-                        words = []
-                        transcript = video.get("title", "")
-
-                    remapped_words = [
-                        {"word": w.word, "start": max(0.0, w.start), "end": min(w.end, dur)}
-                        for w in words if w.start < dur
-                    ]
-                    cam_box = detect_facecam_safe(slice_path)
-                    metadata = generate_minecraft_metadata(
-                        video.get("creator") or video["creator"],
-                        video.get("title") or "",
-                        transcript,
-                    )
-                    write_ass_subtitles(
-                        remapped_words, ass_path, dur, metadata["hook_title"],
-                        has_webcam=bool(cam_box),
-                    )
-                    render_split_vertical(
-                        slice_path, ass_path, out_path,
-                        [{"start": 0.0, "end": dur}], cam_box,
-                    )
-                    rendered.append({
-                        "path": out_path,
-                        "title": metadata["yt_title"],
-                        "description": metadata["description"],
-                        "start": start_sec,
-                        "end": end_sec,
-                    })
-                    print(f"Rendered Minecraft clip {i + 1}: {out_path}")
-                except Exception as e:
-                    print(f"Minecraft slice {i + 1} failed: {e}")
-                    continue
-        finally:
             try:
-                if source_path.exists():
-                    source_path.unlink()
-                    print(f"Removed source video {source_path}")
+                print(f"Downloading Minecraft Twitch clip {i + 1}/{len(clips)}: {clip_id}")
+                subprocess.run(
+                    ["yt-dlp", "-f", "b[ext=mp4]/mp4", "-o", str(raw_path), clip["url"]],
+                    check=True,
+                )
+                dur = get_video_duration(raw_path)
+
+                words, _info, transcript = transcribe_and_verify(raw_path)
+                if words is None:
+                    words = []
+                    transcript = clip.get("title", "")
+
+                remapped_words = [
+                    {"word": w.word, "start": max(0.0, w.start), "end": min(w.end, dur)}
+                    for w in words if w.start < dur
+                ]
+                cam_box = detect_facecam_safe(raw_path)
+                creator = (
+                    clip.get("creator")
+                    or clip.get("broadcaster_name")
+                    or clip.get("creator_name")
+                    or "Minecraft"
+                )
+                metadata = generate_minecraft_metadata(
+                    creator,
+                    clip.get("title") or "",
+                    transcript,
+                )
+                write_ass_subtitles(
+                    remapped_words, ass_path, dur, metadata["hook_title"],
+                    has_webcam=bool(cam_box),
+                )
+                render_split_vertical(
+                    raw_path, ass_path, out_path,
+                    [{"start": 0.0, "end": dur}], cam_box,
+                )
+                rendered.append({
+                    "path": out_path,
+                    "title": metadata["yt_title"],
+                    "description": metadata["description"],
+                    "clip_id": clip_id,
+                })
+                mark_processed(clip_id)
+                print(f"Rendered Minecraft clip {i + 1}: {out_path}")
             except Exception as e:
-                print(f"Warning: Could not remove source video: {e}")
+                print(f"Minecraft clip {clip_id} failed: {e}")
+                continue
 
         if not rendered:
             print("No Minecraft clips rendered successfully.")
@@ -1783,13 +1582,10 @@ def run_minecraft_batch(schedule, clip_count=4, upload_yt3=True, upload_yt2=Fals
             except Exception as e:
                 print(f"Channel #2 Minecraft upload failed: {e}")
 
-        if uploaded_any:
-            mark_processed(video["id"])
-
         return uploaded_any
 
     finally:
-        for path in [source_path] + temp_paths + [item["path"] for item in rendered]:
+        for path in temp_paths + [item["path"] for item in rendered]:
             try:
                 if Path(path).exists():
                     Path(path).unlink()
@@ -1810,7 +1606,7 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload
     attempted_upload = False
 
     try:
-        subprocess.run(["yt-dlp", *_youtube_auth_args(clip["url"]), "-f", "b[ext=mp4]/mp4", "-o", str(raw_mp4), clip["url"]], check=True)
+        subprocess.run(["yt-dlp", "-f", "b[ext=mp4]/mp4", "-o", str(raw_mp4), clip["url"]], check=True)
 
         # 1. Strict Nudity & Adult-Content Guard
         if contains_nsfw(raw_mp4):
