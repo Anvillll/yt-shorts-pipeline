@@ -536,7 +536,10 @@ def _ytdlp_supports_remote_components():
 def _youtube_auth_args(url):
     if not url or ("youtube.com" not in url and "youtu.be" not in url):
         return []
-    args = ["--js-runtimes", "node"]
+    args = [
+        "--extractor-args", "youtube:player_client=mweb,web",
+        "--js-runtimes", "node",
+    ]
     if _ytdlp_supports_remote_components():
         args += ["--remote-components", "ejs:github"]
     try:
@@ -771,19 +774,32 @@ def pick_minecraft_windows(video_info, count=4):
     return windows[:count]
 
 
-def download_video_slice(video_url, start_sec, end_sec, out_path):
-    fmt = "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
+def download_minecraft_source(video_url, out_path):
     cmd = [
         "yt-dlp", "--no-warnings", "--no-playlist",
         *_youtube_auth_args(video_url),
-        "-f", fmt,
+        "-f", "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b",
         "--merge-output-format", "mp4",
-        "--download-sections", f"*{start_sec:.3f}-{end_sec:.3f}",
-        "--force-keyframes-at-cuts",
         "-o", str(out_path),
         video_url,
     ]
     subprocess.run(cmd, check=True)
+
+
+def slice_video_local(source_path, start_sec, end_sec, out_path):
+    duration = max(0.0, end_sec - start_sec)
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start_sec:.3f}",
+        "-i", str(source_path),
+        "-t", f"{duration:.3f}",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "20",
+        "-c:a", "aac",
+        str(out_path),
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 
 def _clean_hook(raw):
@@ -1566,56 +1582,68 @@ def run_minecraft_batch(schedule, clip_count=4, upload_yt3=True, upload_yt2=Fals
         print("Could not select Minecraft clip windows. Skipping batch.")
         return False
 
+    source_path = Path(f"mc_{video['id']}_source.mp4")
     rendered = []
     temp_paths = []
     uploaded_any = False
 
     try:
-        for i, (start_sec, end_sec) in enumerate(windows):
-            slice_path = Path(f"mc_{video['id']}_{i + 1}_slice.mp4")
-            ass_path = Path(f"mc_{video['id']}_{i + 1}.ass")
-            out_path = Path(f"mc_{video['id']}_{i + 1}_short.mp4")
-            temp_paths.extend([slice_path, ass_path])
+        try:
+            print(f"Downloading Minecraft source once: {video['url']}")
+            download_minecraft_source(video["url"], source_path)
 
+            for i, (start_sec, end_sec) in enumerate(windows):
+                slice_path = Path(f"mc_{video['id']}_{i + 1}_slice.mp4")
+                ass_path = Path(f"mc_{video['id']}_{i + 1}.ass")
+                out_path = Path(f"mc_{video['id']}_{i + 1}_short.mp4")
+                temp_paths.extend([slice_path, ass_path])
+
+                try:
+                    print(f"Slicing Minecraft clip {i + 1}/{len(windows)}: {start_sec:.1f}-{end_sec:.1f}s")
+                    slice_video_local(source_path, start_sec, end_sec, slice_path)
+                    dur = get_video_duration(slice_path)
+
+                    words, _info, transcript = transcribe_and_verify(slice_path)
+                    if words is None:
+                        words = []
+                        transcript = video.get("title", "")
+
+                    remapped_words = [
+                        {"word": w.word, "start": max(0.0, w.start), "end": min(w.end, dur)}
+                        for w in words if w.start < dur
+                    ]
+                    cam_box = detect_facecam_safe(slice_path)
+                    metadata = generate_minecraft_metadata(
+                        video.get("creator") or video["creator"],
+                        video.get("title") or "",
+                        transcript,
+                    )
+                    write_ass_subtitles(
+                        remapped_words, ass_path, dur, metadata["hook_title"],
+                        has_webcam=bool(cam_box),
+                    )
+                    render_split_vertical(
+                        slice_path, ass_path, out_path,
+                        [{"start": 0.0, "end": dur}], cam_box,
+                    )
+                    rendered.append({
+                        "path": out_path,
+                        "title": metadata["yt_title"],
+                        "description": metadata["description"],
+                        "start": start_sec,
+                        "end": end_sec,
+                    })
+                    print(f"Rendered Minecraft clip {i + 1}: {out_path}")
+                except Exception as e:
+                    print(f"Minecraft slice {i + 1} failed: {e}")
+                    continue
+        finally:
             try:
-                print(f"Downloading Minecraft slice {i + 1}/{len(windows)}: {start_sec:.1f}-{end_sec:.1f}s")
-                download_video_slice(video["url"], start_sec, end_sec, slice_path)
-                dur = get_video_duration(slice_path)
-
-                words, _info, transcript = transcribe_and_verify(slice_path)
-                if words is None:
-                    words = []
-                    transcript = video.get("title", "")
-
-                remapped_words = [
-                    {"word": w.word, "start": max(0.0, w.start), "end": min(w.end, dur)}
-                    for w in words if w.start < dur
-                ]
-                cam_box = detect_facecam_safe(slice_path)
-                metadata = generate_minecraft_metadata(
-                    video.get("creator") or video["creator"],
-                    video.get("title") or "",
-                    transcript,
-                )
-                write_ass_subtitles(
-                    remapped_words, ass_path, dur, metadata["hook_title"],
-                    has_webcam=bool(cam_box),
-                )
-                render_split_vertical(
-                    slice_path, ass_path, out_path,
-                    [{"start": 0.0, "end": dur}], cam_box,
-                )
-                rendered.append({
-                    "path": out_path,
-                    "title": metadata["yt_title"],
-                    "description": metadata["description"],
-                    "start": start_sec,
-                    "end": end_sec,
-                })
-                print(f"Rendered Minecraft clip {i + 1}: {out_path}")
+                if source_path.exists():
+                    source_path.unlink()
+                    print(f"Removed source video {source_path}")
             except Exception as e:
-                print(f"Minecraft slice {i + 1} failed: {e}")
-                continue
+                print(f"Warning: Could not remove source video: {e}")
 
         if not rendered:
             print("No Minecraft clips rendered successfully.")
@@ -1761,7 +1789,7 @@ def run_minecraft_batch(schedule, clip_count=4, upload_yt3=True, upload_yt2=Fals
         return uploaded_any
 
     finally:
-        for path in temp_paths + [item["path"] for item in rendered]:
+        for path in [source_path] + temp_paths + [item["path"] for item in rendered]:
             try:
                 if Path(path).exists():
                     Path(path).unlink()
