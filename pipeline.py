@@ -38,7 +38,8 @@ MC_SCHEDULE_FILE = Path("mc_schedule.json")
 
 MINECRAFT_TWITCH_CREATORS = [
     "whereswrld", "wemmbumc", "drdonutt", "acookiegod",
-    "caseoh_", "rekrap2", "clownpierce", "purpled", "tubbo", "philza",
+    "rekrap2", "clownpierce", "purpled", "feinberg", "couriway",
+    "tubbo", "philza", "caseoh_",
 ]
 MINECRAFT_GAME_ID = "27471"
 MINECRAFT_BLOCKED_CREATORS = {"nyekomei"}
@@ -706,10 +707,13 @@ def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
     seen = set()
     candidate_target = max(needed_count, needed_count * 3)
 
-    def add_clips(clips, creator_name=""):
+    def add_clips(clips, creator_name="", require_minecraft=False):
         for clip in sorted(clips, key=lambda c: c.get("view_count") or 0, reverse=True):
             clip_id = clip.get("id")
             if not clip_id or clip_id in processed_ids or clip_id in seen:
+                continue
+            if require_minecraft and str(clip.get("game_id", "")) != str(MINECRAFT_GAME_ID):
+                print(f"Skipping non-Minecraft clip {clip_id} (game_id={clip.get('game_id')}).")
                 continue
             if is_blocked_minecraft_clip(clip):
                 print(f"Skipping blocked Minecraft clip {clip_id}: '{clip.get('title', '')}'")
@@ -756,7 +760,7 @@ def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
                 print(f"Twitch clips fetch failed for {login} ({days}d): {e}")
                 continue
             before = len(selected)
-            add_clips(clips, creator_name=login)
+            add_clips(clips, creator_name=login, require_minecraft=True)
             print(f"Minecraft creator {login} ({days}d): +{len(selected) - before} clip(s)")
             if len(selected) >= candidate_target:
                 break
