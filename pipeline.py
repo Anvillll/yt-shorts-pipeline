@@ -514,15 +514,37 @@ def _ensure_cookies_file():
         print(f"Warning: Could not create cookies.txt: {e}")
 
 
+_YTDLP_SUPPORTS_REMOTE_COMPONENTS = None
+
+
+def _ytdlp_supports_remote_components():
+    global _YTDLP_SUPPORTS_REMOTE_COMPONENTS
+    if _YTDLP_SUPPORTS_REMOTE_COMPONENTS is None:
+        try:
+            res = subprocess.run(
+                ["yt-dlp", "--help"],
+                capture_output=True, text=True, timeout=30
+            )
+            _YTDLP_SUPPORTS_REMOTE_COMPONENTS = "--remote-components" in (
+                res.stdout + res.stderr
+            )
+        except Exception:
+            _YTDLP_SUPPORTS_REMOTE_COMPONENTS = False
+    return _YTDLP_SUPPORTS_REMOTE_COMPONENTS
+
+
 def _youtube_auth_args(url):
     if not url or ("youtube.com" not in url and "youtu.be" not in url):
         return []
+    args = ["--js-runtimes", "node"]
+    if _ytdlp_supports_remote_components():
+        args += ["--remote-components", "ejs:github"]
     try:
         if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
-            return ["--cookies", str(COOKIES_FILE), "--sleep-requests", "1"]
+            args = ["--cookies", str(COOKIES_FILE), "--sleep-requests", "1", *args]
     except Exception as e:
         print(f"Warning: Could not check cookies.txt: {e}")
-    return []
+    return args
 
 
 _ensure_cookies_file()
@@ -629,7 +651,7 @@ def select_minecraft_video(processed_ids):
 
 
 def fetch_video_details(video_url):
-    data = _yt_dlp_json(["--dump-single-json", "--no-playlist", video_url])
+    data = _yt_dlp_json(["--skip-download", "-J", "--no-playlist", video_url])
     return data or {}
 
 
@@ -750,14 +772,12 @@ def pick_minecraft_windows(video_info, count=4):
 
 
 def download_video_slice(video_url, start_sec, end_sec, out_path):
-    fmt = (
-        "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/"
-        "b[height<=1080][ext=mp4]/b[ext=mp4]/b"
-    )
+    fmt = "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b"
     cmd = [
         "yt-dlp", "--no-warnings", "--no-playlist",
         *_youtube_auth_args(video_url),
         "-f", fmt,
+        "--merge-output-format", "mp4",
         "--download-sections", f"*{start_sec:.3f}-{end_sec:.3f}",
         "--force-keyframes-at-cuts",
         "-o", str(out_path),
