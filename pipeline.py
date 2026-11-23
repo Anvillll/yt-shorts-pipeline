@@ -36,8 +36,17 @@ UPLOAD_TARGET = os.getenv("UPLOAD_TARGET", "all").strip().lower()
 IST = timezone(timedelta(hours=5, minutes=30))
 MC_SCHEDULE_FILE = Path("mc_schedule.json")
 
-MINECRAFT_TWITCH_CREATORS = ["whereswrld", "wemmbumc", "drdonutt", "acookiegod"]
+MINECRAFT_TWITCH_CREATORS = [
+    "whereswrld", "wemmbumc", "drdonutt", "acookiegod",
+    "caseoh_", "rekrap2", "clownpierce", "purpled", "tubbo", "philza",
+]
 MINECRAFT_GAME_ID = "27471"
+MINECRAFT_BLOCKED_CREATORS = {"nyekomei"}
+MINECRAFT_BLOCKED_KEYWORDS = {
+    "vtuber", "mommy", "hottest", "hot nurse", "nurses", "waifu", "lewd",
+    "booba", "oppai", "asmr", "bikini", "cleavage", "18+", "nsfw",
+    "ecchi", "hentai", "gyatt", "thicc",
+}
 
 PRIORITY_STREAMERS = [
     "kaicenat", "ishowspeed", "xqc", "caseoh_", "jynxzi",
@@ -87,6 +96,17 @@ def has_blocked_keywords(title):
         if word in ["18+", "xxx"] and word in t_lower:
             return True
     return False
+
+
+def is_blocked_minecraft_clip(clip):
+    creator_keys = {
+        str(clip.get("broadcaster_login", "")).lower(),
+        str(clip.get("broadcaster_name", "")).lower(),
+    }
+    if creator_keys & MINECRAFT_BLOCKED_CREATORS:
+        return True
+    title_lower = str(clip.get("title", "")).lower()
+    return any(term in title_lower for term in MINECRAFT_BLOCKED_KEYWORDS)
 
 
 def contains_nsfw(video_path):
@@ -532,6 +552,8 @@ def generate_minecraft_metadata(creator, raw_title, transcript):
 
     prompt = (
         "You are an expert viral Minecraft Shorts creator.\n\n"
+        "Keep hooks and titles 100% YouTube family-friendly and advertiser-safe. "
+        "Never generate suggestive, sexualized, or adult double-entendre phrasing.\n\n"
         f"Creator: {creator}\n"
         f"Original Video Title: {raw_title}\n"
         f"Spoken Transcript: {transcript}\n\n"
@@ -641,9 +663,12 @@ def fetch_clips_for_window(token, game_id, hours):
 def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
     """
     Select unused Minecraft Twitch clips. Creator priority is strict:
-    whereswrld -> wemmbumc -> drdonutt -> acookiegod, each tried over the last
-    7 days and then 30 days. If still short, top up from the Minecraft category
-    (English only, last 7 days) by highest view_count.
+    whereswrld -> wemmbumc -> drdonutt -> acookiegod -> additional
+    family-friendly creators, each tried over the last 7 days and then 30 days.
+    If still short, top up from the Minecraft category
+    (English only, last 7 days) by highest view_count. Blocked creators and
+    suggestive keywords are filtered out, and up to needed_count * 3 candidates
+    are returned so NudeNet rejections still leave enough clean clips.
     """
     headers = {
         "Client-ID": os.environ["TWITCH_CLIENT_ID"],
@@ -679,11 +704,15 @@ def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
 
     selected = []
     seen = set()
+    candidate_target = max(needed_count, needed_count * 3)
 
     def add_clips(clips, creator_name=""):
         for clip in sorted(clips, key=lambda c: c.get("view_count") or 0, reverse=True):
             clip_id = clip.get("id")
             if not clip_id or clip_id in processed_ids or clip_id in seen:
+                continue
+            if is_blocked_minecraft_clip(clip):
+                print(f"Skipping blocked Minecraft clip {clip_id}: '{clip.get('title', '')}'")
                 continue
             try:
                 duration = float(clip.get("duration") or 0)
@@ -695,7 +724,7 @@ def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
                 clip["creator"] = creator_name
             seen.add(clip_id)
             selected.append(clip)
-            if len(selected) >= needed_count:
+            if len(selected) >= candidate_target:
                 return
 
     def fetch_broadcaster(broadcaster_id, days):
@@ -716,10 +745,10 @@ def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
         return resp.json().get("data", [])
 
     for login, broadcaster_id in creator_ids:
-        if len(selected) >= needed_count:
+        if len(selected) >= candidate_target:
             break
         for days in (7, 30):
-            if len(selected) >= needed_count:
+            if len(selected) >= candidate_target:
                 break
             try:
                 clips = fetch_broadcaster(broadcaster_id, days)
@@ -729,10 +758,10 @@ def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
             before = len(selected)
             add_clips(clips, creator_name=login)
             print(f"Minecraft creator {login} ({days}d): +{len(selected) - before} clip(s)")
-            if len(selected) >= needed_count:
+            if len(selected) >= candidate_target:
                 break
 
-    if len(selected) < needed_count:
+    if len(selected) < candidate_target:
         started_at = (
             datetime.now(timezone.utc) - timedelta(days=7)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -760,7 +789,7 @@ def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
         add_clips(english_clips)
         print(f"Minecraft category fallback (7d, English): +{len(selected) - before} clip(s)")
 
-    for clip in selected[:needed_count]:
+    for clip in selected:
         creator = (
             clip.get("creator")
             or clip.get("broadcaster_name")
@@ -771,7 +800,8 @@ def fetch_minecraft_twitch_clips(twitch_token, processed_ids, needed_count=4):
             f"Minecraft Twitch clip: {clip.get('id')} by {creator} "
             f"({clip.get('view_count') or 0} views, {clip.get('duration') or 0}s)"
         )
-    return selected[:needed_count]
+    print(f"Minecraft candidates selected: {len(selected)} (target {candidate_target})")
+    return selected
 
 
 def format_ass_time(sec):
@@ -1367,10 +1397,12 @@ def upload_instagram_reel(video_path, ig_caption, clip_id):
 
 def run_minecraft_batch(schedule, clip_count=4, upload_yt3=True, upload_yt2=False, yt2_count=0):
     """
-    Select, render, and distribute a Minecraft batch from Twitch clips without
-    any NSFW scan. Channel #3 receives Clip 1 public + Clips 2-4 scheduled
-    (private/publishAt). When upload_yt2 is set, reuse rendered clips for
-    upcoming Channel #2 Morning IST slots (no re-rendering).
+    Select, render, and distribute a Minecraft batch from Twitch clips.
+    NudeNet screens each clip before rendering; rejected clips are logged and
+    skipped so backup candidates can fill the batch. Channel #3 receives Clip 1
+    public + Clips 2-4 scheduled (private/publishAt). When upload_yt2 is set,
+    reuse rendered clips for upcoming Channel #2 Morning IST slots (no
+    re-rendering).
     """
     try:
         twitch_token = get_twitch_token()
@@ -1389,6 +1421,8 @@ def run_minecraft_batch(schedule, clip_count=4, upload_yt3=True, upload_yt2=Fals
 
     try:
         for i, clip in enumerate(clips):
+            if len(rendered) >= clip_count:
+                break
             clip_id = clip["id"]
             raw_path = Path(f"mc_{clip_id}_raw.mp4")
             ass_path = Path(f"mc_{clip_id}.ass")
@@ -1401,6 +1435,18 @@ def run_minecraft_batch(schedule, clip_count=4, upload_yt3=True, upload_yt2=Fals
                     ["yt-dlp", "-f", "b[ext=mp4]/mp4", "-o", str(raw_path), clip["url"]],
                     check=True,
                 )
+                if contains_nsfw(raw_path):
+                    print(
+                        f"Minecraft clip {clip_id} rejected by NudeNet "
+                        "(NSFW/suggestive). Logging and trying next candidate."
+                    )
+                    mark_processed(clip_id)
+                    try:
+                        if raw_path.exists():
+                            raw_path.unlink()
+                    except Exception:
+                        pass
+                    continue
                 dur = get_video_duration(raw_path)
 
                 words, _info, transcript = transcribe_and_verify(raw_path)
