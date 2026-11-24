@@ -1,4 +1,7 @@
 {
-  "yt3_last_scheduled_utc": "2026-11-24T03:30:00Z",
-  "yt2_morning_scheduled_dates": []
+  "yt3_last_scheduled_utc": "2026-11-25T15:30:00Z",
+  "yt2_morning_scheduled_dates": [
+    "2026-11-24",
+    "2026-11-25"
+  ]
 }
