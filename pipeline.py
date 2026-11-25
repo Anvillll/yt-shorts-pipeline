@@ -2506,6 +2506,9 @@ def render_top3_countdown(streamer_name, play_items, intro_line, out_path):
     Render the 1080x1920 Noon countdown Reel:
     ~3.5s blurred narrated intro + #3 -> #2 -> #1 segments at 1.15x,
     each with a persistent '#N • CLIP NAME' pill and a TTS callout.
+    Each segment preserves the streamer facecam using the same split-screen
+    layout as the Shorts/Reels renderer: facecam on top + gameplay on bottom
+    when detected, or full 16:9 gameplay over a blurred 9:16 background.
     """
     if edge_tts is None or Image is None:
         raise RuntimeError("edge-tts and Pillow are required for the Top-3 countdown.")
@@ -2526,6 +2529,9 @@ def render_top3_countdown(streamer_name, play_items, intro_line, out_path):
             callout_mp3 = os.path.join(temp_dir, f"callout_{rank}.mp3")
             pill_png = os.path.join(temp_dir, f"pill_{rank}.png")
 
+            # Detect the facecam on the untrimmed raw clip before speeding it up.
+            cam_box = detect_facecam_safe(item["path"])
+
             generate_tts_audio(callouts[rank], callout_mp3)
             start, source_len = _pick_top3_window(
                 item.get("words") or [], item["duration"]
@@ -2533,11 +2539,42 @@ def render_top3_countdown(streamer_name, play_items, intro_line, out_path):
             output_dur = source_len / TOP3_SEGMENT_SPEED
             _create_pill_overlay(f"#{rank} • {item['name']}", pill_png)
 
+            if cam_box:
+                cx, cy, cw, ch = cam_box
+                # Facecam split-screen: top 1080x680 facecam, bottom 1080x1240 gameplay.
+                # Keep the pill just above the seam so it never covers the face.
+                layout_filter = (
+                    f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:680,"
+                    "setsar=1,format=yuv420p[top];"
+                    "[0:v]scale=1080:1240:force_original_aspect_ratio=increase,"
+                    "crop=1080:1240,setsar=1,format=yuv420p[bottom];"
+                    "[top][bottom]vstack=inputs=2,"
+                    f"setpts=PTS/{TOP3_SEGMENT_SPEED},fps=30[sv];"
+                    "[sv][1:v]overlay=(W-w)/2:680-h-24[v];"
+                )
+                print(
+                    f"Top-3 segment #{rank}: facecam split layout "
+                    f"(box={cam_box}, pill above seam)"
+                )
+            else:
+                # Faceless fallback: full 16:9 gameplay over a blurred 9:16 background.
+                layout_filter = (
+                    "[0:v]split=2[bg][fg];"
+                    "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+                    "crop=1080:1920,boxblur=24:2,setsar=1[bgblur];"
+                    "[fg]scale=1080:-2,setsar=1[fgscaled];"
+                    "[bgblur][fgscaled]overlay=(W-w)/2:(H-h)/2,"
+                    f"setpts=PTS/{TOP3_SEGMENT_SPEED},fps=30[sv];"
+                    "[sv][1:v]overlay=(W-w)/2:110[v];"
+                )
+                print(
+                    f"Top-3 segment #{rank}: full-frame blurred layout "
+                    "(no confident facecam)"
+                )
+
             filtergraph = (
-                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
-                f"crop=1080:1920,setsar=1,setpts=PTS/{TOP3_SEGMENT_SPEED},fps=30[sv];"
-                "[sv][1:v]overlay=(W-w)/2:90[v];"
-                f"[0:a]atempo={TOP3_SEGMENT_SPEED},aresample=44100,"
+                layout_filter
+                + f"[0:a]atempo={TOP3_SEGMENT_SPEED},aresample=44100,"
                 "aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.22[duck];"
                 "[2:a]aresample=44100,"
                 "aformat=sample_fmts=fltp:channel_layouts=stereo,"
