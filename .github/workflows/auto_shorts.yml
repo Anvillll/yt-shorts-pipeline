@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Upload target (all or yt2_only)'
+        description: 'Upload target (all, yt2_only, yt3_only, or ig_noon_only)'
         required: false
         default: 'all'
         type: choice
@@ -12,6 +12,7 @@ on:
           - all
           - yt2_only
           - yt3_only
+          - ig_noon_only
 
 permissions:
   contents: write
@@ -36,7 +37,7 @@ jobs:
           pip install --no-cache-dir \
             faster-whisper requests \
             google-api-python-client google-auth-oauthlib \
-            nudenet google-genai
+            nudenet google-genai edge-tts pillow
           pip install --no-cache-dir -U "yt-dlp[default]"
           pip install --no-cache-dir --force-reinstall opencv-contrib-python-headless
 

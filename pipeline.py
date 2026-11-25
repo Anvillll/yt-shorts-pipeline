@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -22,6 +23,16 @@ try:
     from google.genai import types
 except ImportError:
     genai = None
+
+try:
+    import edge_tts
+except ImportError:
+    edge_tts = None
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    Image = ImageDraw = ImageFont = None
 
 PROCESSED_FILE = Path("processed.txt")
 PROCESSED = set(PROCESSED_FILE.read_text().splitlines()) if PROCESSED_FILE.exists() else set()
@@ -53,6 +64,15 @@ PRIORITY_STREAMERS = [
     "kaicenat", "ishowspeed", "xqc", "caseoh_", "jynxzi",
     "adinross", "stableronaldo", "plaqueboymax"
 ]
+
+# Instagram Reel intro / Noon Top-3 countdown settings
+TTS_VOICE = "en-US-AndrewNeural"
+TTS_RATE = "+8%"
+IG_INTRO_SPEED = 1.08
+TOP3_MIN_CLIP_DURATION = 12.0
+TOP3_SEGMENT_SPEED = 1.15
+TOP3_TARGET_OUTPUT_SEGMENT = 14.0  # seconds after the 1.15x speed-up
+TOP3_MAX_CANDIDATE_CLIPS = 8
 
 BLOCKED_KEYWORDS = [
     "strip", "stripclub", "club", "nsfw", "nude", "nudity", "naked",
@@ -1190,6 +1210,279 @@ def render_split_vertical(raw_mp4, ass_path, out_mp4, timeline_segments, cam_box
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _load_bold_font(size):
+    """Load a bold TrueType font for Pillow overlays, with safe fallbacks."""
+    if ImageFont is None:
+        return None
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "arialbd.ttf",
+        "DejaVuSans-Bold.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def _create_hook_overlay(hook_text, out_png, width=1080, height=1920):
+    """Render bold centered white hook text with a black outline as a transparent PNG."""
+    if Image is None or ImageDraw is None:
+        raise RuntimeError("Pillow is required to build the narrated intro overlay.")
+
+    text = (hook_text or "").replace("\\N", "\n").strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    if not text:
+        text = "WATCH THIS"
+    wrapped = textwrap.fill(text, width=18)
+
+    font_size = 104
+    font = _load_bold_font(font_size)
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    spacing = int(font_size * 0.18)
+
+    while font_size > 44:
+        font = _load_bold_font(font_size)
+        spacing = int(font_size * 0.18)
+        bbox = draw.multiline_textbbox(
+            (0, 0), wrapped, font=font, align="center", spacing=spacing, stroke_width=8
+        )
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        if text_w <= width - 140 and text_h <= height * 0.42:
+            break
+        font_size -= 6
+
+    common = dict(
+        font=font, fill=(255, 255, 255, 255), align="center",
+        spacing=spacing, stroke_width=8, stroke_fill=(0, 0, 0, 255),
+    )
+    try:
+        draw.multiline_text((width // 2, height // 2), wrapped, anchor="mm", **common)
+    except Exception:
+        bbox = draw.multiline_textbbox(
+            (0, 0), wrapped, font=font, align="center", spacing=spacing, stroke_width=8
+        )
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+        draw.multiline_text(
+            ((width - text_w) // 2, (height - text_h) // 2), wrapped, **common
+        )
+
+    img.save(out_png)
+
+
+def _create_pill_overlay(label, out_png):
+    """Render the persistent '#N • CLIP NAME' top pill as a compact transparent PNG."""
+    if Image is None or ImageDraw is None:
+        raise RuntimeError("Pillow is required to build the countdown pill overlay.")
+
+    label = (label or "").strip()
+    font_size = 58
+    stroke = 5
+    dummy = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    measure = ImageDraw.Draw(dummy)
+
+    font = _load_bold_font(font_size)
+    bbox = measure.textbbox((0, 0), label, font=font, stroke_width=stroke)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    while text_w > 960 and font_size > 34:
+        font_size -= 4
+        font = _load_bold_font(font_size)
+        bbox = measure.textbbox((0, 0), label, font=font, stroke_width=stroke)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+
+    pad_x, pad_y = 42, 22
+    width = min(1080, text_w + pad_x * 2)
+    height = text_h + pad_y * 2
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle(
+        [0, 0, width - 1, height - 1], radius=height // 2, fill=(0, 0, 0, 185)
+    )
+
+    common = dict(
+        font=font, fill=(255, 255, 255, 255), stroke_width=stroke,
+        stroke_fill=(0, 0, 0, 255),
+    )
+    try:
+        draw.text((width // 2, height // 2), label, anchor="mm", **common)
+    except Exception:
+        draw.text(((width - text_w) // 2, (height - text_h) // 2), label, **common)
+
+    img.save(out_png)
+
+
+def generate_tts_audio(text, out_mp3, voice="en-US-AndrewNeural", rate="+8%"):
+    """
+    Synthesize narration with edge-tts and return the exact MP3 duration in seconds.
+    """
+    if edge_tts is None:
+        raise RuntimeError("edge-tts is not installed; cannot synthesize narration.")
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Cannot synthesize empty narration text.")
+
+    async def _save():
+        communicator = edge_tts.Communicate(text, voice, rate=rate)
+        await communicator.save(str(out_mp3))
+
+    asyncio.run(_save())
+    duration = get_video_duration(out_mp3)
+    print(f"TTS narration saved to {out_mp3} ({duration:.2f}s)")
+    return duration
+
+
+def _fallback_ig_intro_narration(streamer_name):
+    return (
+        f"{streamer_name} turns a routine moment into total chaos, and the reaction "
+        f"is exactly why this clip blew up online."
+    )
+
+
+def generate_ig_intro_narration(transcript, clip_title, streamer_name):
+    """
+    Write 1-2 sentences (12-22 words) of original context/stakes commentary for an
+    Instagram Reel intro. Falls back to a safe template when Gemini is unavailable.
+    """
+    fallback = _fallback_ig_intro_narration(streamer_name or "this streamer")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key or not genai:
+        return fallback
+
+    prompt = (
+        "You are a sharp short-form gaming commentator writing the spoken intro for an "
+        "Instagram Reel.\n\n"
+        f"Streamer: {streamer_name}\n"
+        f"Clip title: {clip_title}\n"
+        f"Spoken transcript: {transcript}\n\n"
+        "Write ORIGINAL commentary that explains the context and stakes of the moment "
+        "in 1-2 sentences and 12-22 words total. Do not quote the clip. "
+        "No hashtags, no emojis, no stage directions.\n\n"
+        "Return ONLY a JSON object with one field: {\"narration\": \"...\"}"
+    )
+
+    for model_name in ["gemini-2.5-flash", "gemini-3.8-flash"]:
+        try:
+            client = genai.Client(api_key=gemini_key, http_options={"api_version": "v1beta"})
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            data = json.loads(response.text.strip())
+            narration = re.sub(r"\s+", " ", (data.get("narration") or "").strip())
+            narration = narration.replace("\n", " ")
+            word_count = len(narration.split())
+            if not narration or not (12 <= word_count <= 22):
+                raise ValueError(f"narration word count {word_count} outside 12-22")
+            print(f"Gemini AI ({model_name}) IG intro narration: {narration}")
+            return narration
+        except Exception as e:
+            print(f"Gemini {model_name} IG intro narration failed: {type(e).__name__}: {e}")
+            continue
+
+    print("All Gemini models failed for IG intro narration. Using fallback.")
+    return fallback
+
+
+def build_blurred_narrated_intro(source_video_path, hook_text, narration_text, out_path):
+    """
+    Build a 1080x1920 blurred clip intro with bold centered hook text and TTS narration.
+    The intro lasts exactly narration_duration + 0.35s and uses AAC 44100Hz stereo audio.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="ig_intro_")
+    try:
+        narration_mp3 = os.path.join(temp_dir, "narration.mp3")
+        overlay_png = os.path.join(temp_dir, "hook.png")
+
+        audio_dur = generate_tts_audio(narration_text, narration_mp3)
+        intro_dur = audio_dur + 0.35
+        _create_hook_overlay(hook_text, overlay_png)
+
+        filtergraph = (
+            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920,boxblur=25:5,eq=brightness=-0.12,setsar=1,fps=30[bg];"
+            "[bg][1:v]overlay=(W-w)/2:(H-h)/2:format=auto[v];"
+            "[2:a]aresample=44100,"
+            "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"apad=whole_dur={intro_dur:.3f}[a]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-stream_loop", "-1", "-i", str(source_video_path),
+            "-loop", "1", "-i", overlay_png,
+            "-i", narration_mp3,
+            "-filter_complex", filtergraph,
+            "-map", "[v]", "-map", "[a]",
+            "-t", f"{intro_dur:.3f}",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        print(f"Built narrated blurred intro ({intro_dur:.2f}s): {out_path}")
+        return intro_dur
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def render_instagram_reel_with_intro(
+    source_video_path, hook_text, narration_text, reel_path, out_path
+):
+    """
+    Prepend a blurred narrated intro to an already-rendered vertical Reel.
+    The Reel body is sped up to 1.08x with setpts/atempo; YouTube renders are untouched.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="ig_reel_")
+    try:
+        intro_path = os.path.join(temp_dir, "intro.mp4")
+        build_blurred_narrated_intro(
+            source_video_path, hook_text, narration_text, intro_path
+        )
+
+        filtergraph = (
+            "[0:v]fps=30,format=yuv420p,setsar=1[iv];"
+            "[0:a]aresample=44100,"
+            "aformat=sample_fmts=fltp:channel_layouts=stereo[ia];"
+            f"[1:v]setpts=PTS/{IG_INTRO_SPEED},fps=30,format=yuv420p,setsar=1[rv];"
+            f"[1:a]atempo={IG_INTRO_SPEED},aresample=44100,"
+            "aformat=sample_fmts=fltp:channel_layouts=stereo[ra];"
+            "[iv][ia][rv][ra]concat=n=2:v=1:a=1[v][a]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", intro_path,
+            "-i", str(reel_path),
+            "-filter_complex", filtergraph,
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        print(f"Rendered Instagram Reel with narrated intro: {out_path}")
+        return True
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def upload_youtube(
     video_path,
     title,
@@ -1652,6 +1945,7 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload
     raw_mp4 = Path(f"{clip_id}_raw.mp4")
     ass_path = Path(f"{clip_id}.ass")
     out_mp4 = Path(f"{clip_id}_short.mp4")
+    ig_reel_path = Path(f"{clip_id}_ig_reel.mp4")
 
     attempted_upload = False
 
@@ -1723,15 +2017,34 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload
         else:
             print("YouTube Channel #2 not eligible (token missing, daily cap reached, or outside IST window). Skipping.")
 
-        # 10. Upload to Instagram Reels (if within daily limit)
-        if can_upload_ig:
+        # 10. Build a narrated blurred intro and upload to Instagram Reels
+        has_ig_creds = bool(
+            os.environ.get("IG_USER_ID", "").strip()
+            and os.environ.get("IG_ACCESS_TOKEN", "").strip()
+        )
+        if can_upload_ig and has_ig_creds:
             try:
+                print("Generating narrated blurred intro for Instagram Reels...")
+                narration = generate_ig_intro_narration(transcript, title, broadcaster)
+                ig_video_path = out_mp4
+                try:
+                    render_instagram_reel_with_intro(
+                        raw_mp4, hook_title, narration, out_mp4, ig_reel_path
+                    )
+                    ig_video_path = ig_reel_path
+                except Exception as intro_err:
+                    print(
+                        f"Instagram narrated intro failed ({intro_err}); "
+                        "falling back to the plain vertical Reel."
+                    )
                 print("Uploading to Instagram Reels...")
-                if upload_instagram_reel(out_mp4, ig_caption, clip_id):
+                if upload_instagram_reel(ig_video_path, ig_caption, clip_id):
                     increment_daily_count("ig")
                     any_upload_succeeded = True
             except Exception as e:
                 print(f"Instagram upload failed: {e}")
+        elif not has_ig_creds:
+            print("Instagram credentials not set. Skipping Instagram upload.")
         else:
             print("Instagram daily limit reached for today. Skipping Instagram upload.")
 
@@ -1744,7 +2057,7 @@ def process_and_upload_candidate(clip, can_upload_yt, can_upload_yt2, can_upload
         return False, attempted_upload
 
     finally:
-        for p in (raw_mp4, ass_path, out_mp4):
+        for p in (raw_mp4, ass_path, out_mp4, ig_reel_path):
             if p.exists():
                 p.unlink()
 
@@ -1881,6 +2194,503 @@ def run_gta_pipeline(can_upload_yt, can_upload_yt2, can_upload_ig):
     return uploaded
 
 
+def _get_broadcaster_pairs(token, usernames):
+    """Resolve Twitch logins to (display_name, broadcaster_id) pairs, preserving order."""
+    if not usernames:
+        return []
+    headers = {
+        "Client-ID": os.environ["TWITCH_CLIENT_ID"],
+        "Authorization": f"Bearer {token}",
+    }
+    resp = requests.get(
+        "https://api.twitch.tv/helix/users",
+        headers=headers,
+        params=[("login", login) for login in usernames],
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json().get("data", [])
+    by_login = {str(u.get("login", "")).lower(): u for u in data}
+    pairs = []
+    for login in usernames:
+        user = by_login.get(login.lower())
+        if user and user.get("id"):
+            pairs.append((user.get("display_name") or login, user["id"]))
+    return pairs
+
+
+def _pick_top3_window(words, duration):
+    """
+    Pick a ~16.1s source window (≈14s after the 1.15x speed-up) with the most speech.
+    Returns (start, source_length). Clips shorter than the target use the whole clip.
+    """
+    target_source = TOP3_TARGET_OUTPUT_SEGMENT * TOP3_SEGMENT_SPEED
+    if duration <= target_source:
+        return 0.0, duration
+
+    source_len = min(duration, target_source)
+    best_start = 0.0
+    best_score = -1
+    step = 0.25
+    t = 0.0
+    while t + source_len <= duration + 1e-6:
+        score = sum(
+            1 for w in words
+            if getattr(w, "start", 0.0) >= t
+            and getattr(w, "end", 0.0) <= t + source_len
+        )
+        if score > best_score:
+            best_score = score
+            best_start = t
+        t += step
+    return best_start, source_len
+
+
+def _fallback_top3_name(title):
+    clean = re.sub(r"[^A-Za-z0-9 ]", " ", title or "")
+    stop = {
+        "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for",
+        "with", "this", "that", "is", "was", "he", "she", "they", "it", "his",
+        "her", "my", "your", "at", "by", "from", "so", "just",
+    }
+    words = [w for w in clean.split() if w.lower() not in stop]
+    if not words:
+        words = clean.split() or ["BIG", "MOMENT"]
+    if len(words) < 2:
+        words.append("MOMENT")
+    return " ".join(words[:4]).upper()
+
+
+def _clean_top3_name(name, fallback):
+    clean = re.sub(r"[^A-Za-z0-9 ]", " ", str(name or "")).upper()
+    words = clean.split()
+    if len(words) < 2:
+        return fallback
+    return " ".join(words[:4])
+
+
+def generate_top3_metadata(streamer_name, play_items):
+    """
+    Generate a 1-sentence countdown intro plus 2-4 word names for the #3/#2/#1 clips.
+    play_items must be in playback order: [#3, #2, #1].
+    """
+    fallback_names = {
+        item["rank"]: _fallback_top3_name(item["clip"].get("title", ""))
+        for item in play_items
+    }
+    fallback_intro = (
+        f"Three moments from {streamer_name} that prove why the internet "
+        "cannot stop watching."
+    )
+    result = {
+        "intro_line": fallback_intro,
+        "names": dict(fallback_names),
+    }
+
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key or not genai:
+        return result
+
+    clip_blocks = []
+    for item in play_items:
+        rank = item["rank"]
+        clip = item["clip"]
+        transcript = (item.get("transcript") or "").strip()
+        if len(transcript) > 700:
+            transcript = transcript[:700]
+        clip_blocks.append(
+            f"#{rank} title: {clip.get('title', '')}\n"
+            f"#{rank} transcript: {transcript}\n"
+        )
+
+    prompt = (
+        "You are a viral short-form editor building an Instagram Reel countdown of a "
+        "streamer's top 3 moments.\n\n"
+        f"Streamer: {streamer_name}\n\n"
+        "The clips will play in this order: #3, then #2, then #1.\n\n"
+        + "\n".join(clip_blocks)
+        + "\nReturn a strictly valid JSON object with EXACTLY these four fields:\n"
+        "1. 'intro_line': one punchy spoken sentence (8-14 words) that sets up the "
+        "countdown and the streamer.\n"
+        "2. 'clip_3_name': a 2-4 word title for the #3 clip.\n"
+        "3. 'clip_2_name': a 2-4 word title for the #2 clip.\n"
+        "4. 'clip_1_name': a 2-4 word title for the #1 clip.\n"
+        "Use uppercase-friendly short phrases, no hashtags, no emojis, no quotes. "
+        "Return ONLY the raw JSON object."
+    )
+
+    for model_name in ["gemini-2.5-flash", "gemini-3.8-flash"]:
+        try:
+            client = genai.Client(api_key=gemini_key, http_options={"api_version": "v1beta"})
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            data = json.loads(response.text.strip())
+
+            intro_line = re.sub(r"\s+", " ", (data.get("intro_line") or "").strip())
+            if not intro_line or not (5 <= len(intro_line.split()) <= 18):
+                intro_line = fallback_intro
+            names = {
+                3: _clean_top3_name(data.get("clip_3_name"), fallback_names[3]),
+                2: _clean_top3_name(data.get("clip_2_name"), fallback_names[2]),
+                1: _clean_top3_name(data.get("clip_1_name"), fallback_names[1]),
+            }
+            print(f"Gemini AI ({model_name}) Top-3 intro: {intro_line}")
+            print(f"Gemini AI ({model_name}) Top-3 names: {names}")
+            return {"intro_line": intro_line, "names": names}
+        except Exception as e:
+            print(f"Gemini {model_name} Top-3 metadata failed: {type(e).__name__}: {e}")
+            continue
+
+    print("All Gemini models failed for Top-3 metadata. Using fallback names.")
+    return result
+
+
+def find_top3_streamer_clips(token, game_id):
+    """
+    Find one streamer with at least 3 unused, NudeNet-clean clips of 12s+.
+    Searches PRIORITY_STREAMERS first, then the most-viewed recent GTA VI
+    broadcasters. Returns (streamer_display_name, clip_items) with downloaded
+    local paths, or (None, []).
+    """
+    try:
+        candidate_pairs = _get_broadcaster_pairs(token, PRIORITY_STREAMERS)
+    except Exception as e:
+        print(f"Top-3 priority streamer lookup failed: {e}")
+        candidate_pairs = []
+    seen_broadcaster_ids = {bid for _, bid in candidate_pairs}
+
+    try:
+        recent = fetch_clips_for_window(token, game_id, 168)
+    except Exception as e:
+        print(f"Top-3 recent GTA clip fetch failed: {e}")
+        recent = []
+
+    best_views = {}
+    display_names = {}
+    for clip in recent:
+        bid = str(clip.get("broadcaster_id") or "")
+        if not bid:
+            continue
+        best_views[bid] = max(best_views.get(bid, 0), clip.get("view_count") or 0)
+        display_names[bid] = clip.get("broadcaster_name") or bid
+
+    ranked_broadcasters = sorted(best_views.items(), key=lambda kv: kv[1], reverse=True)
+    for bid, _views in ranked_broadcasters:
+        if bid in seen_broadcaster_ids:
+            continue
+        seen_broadcaster_ids.add(bid)
+        candidate_pairs.append((display_names.get(bid, bid), bid))
+        if len(candidate_pairs) >= len(PRIORITY_STREAMERS) + 10:
+            break
+
+    for display_name, broadcaster_id in candidate_pairs:
+        print(f"\nTop-3 candidate streamer: {display_name}")
+        collected = {}
+        for hours in (168, 720):
+            try:
+                raw_clips = fetch_clips_for_broadcaster(token, broadcaster_id, hours)
+            except Exception as e:
+                print(f"Top-3 clip fetch failed for {display_name} ({hours}h): {e}")
+                continue
+            for clip in raw_clips:
+                clip_id = clip.get("id")
+                if not clip_id or clip_id in PROCESSED or clip_id in collected:
+                    continue
+                if str(clip.get("language", "")).lower() != "en":
+                    continue
+                try:
+                    duration = float(clip.get("duration") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if duration < TOP3_MIN_CLIP_DURATION:
+                    continue
+                title = clip.get("title", "")
+                if not is_ascii_english_title(title):
+                    continue
+                if has_blocked_keywords(title):
+                    continue
+                collected[clip_id] = clip
+            if len(collected) >= 3:
+                break
+
+        clips = sorted(
+            collected.values(), key=lambda c: c.get("view_count") or 0, reverse=True
+        )
+        if len(clips) < 3:
+            print(f"Only {len(clips)} usable clip(s) for {display_name}.")
+            continue
+
+        clean_items = []
+        downloaded = []
+        for clip in clips[:TOP3_MAX_CANDIDATE_CLIPS]:
+            clip_id = clip["id"]
+            raw_path = Path(f"top3_{clip_id}_raw.mp4")
+            try:
+                subprocess.run(
+                    ["yt-dlp", "-f", "b[ext=mp4]/mp4", "-o", str(raw_path), clip["url"]],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                print(f"Top-3 download failed for {clip_id}: {e}")
+                continue
+            downloaded.append(raw_path)
+
+            try:
+                if contains_nsfw(raw_path):
+                    print(f"Top-3 clip {clip_id} rejected by NudeNet. Marking processed.")
+                    mark_processed(clip_id)
+                    try:
+                        raw_path.unlink()
+                    except Exception:
+                        pass
+                    continue
+
+                duration = get_video_duration(raw_path)
+                words, _info, transcript = transcribe_and_verify(raw_path)
+            except Exception as e:
+                print(f"Top-3 screening failed for {clip_id}: {e}")
+                try:
+                    raw_path.unlink()
+                except Exception:
+                    pass
+                continue
+
+            if words is None:
+                print(
+                    f"Top-3 clip {clip_id} audio was not verified English; "
+                    "using title context and a default trim window."
+                )
+                words = []
+                transcript = clip.get("title", "")
+
+            clean_items.append({
+                "clip": clip,
+                "path": raw_path,
+                "duration": duration,
+                "words": words,
+                "transcript": transcript,
+            })
+            if len(clean_items) >= 3:
+                break
+
+        if len(clean_items) >= 3:
+            used_paths = {item["path"] for item in clean_items}
+            for path in downloaded:
+                if path not in used_paths:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+            print(f"Top-3 streamer selected: {display_name}")
+            return display_name, clean_items
+
+        for item in clean_items:
+            try:
+                item["path"].unlink()
+            except Exception:
+                pass
+        for path in downloaded:
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+    return None, []
+
+
+def render_top3_countdown(streamer_name, play_items, intro_line, out_path):
+    """
+    Render the 1080x1920 Noon countdown Reel:
+    ~3.5s blurred narrated intro + #3 -> #2 -> #1 segments at 1.15x,
+    each with a persistent '#N • CLIP NAME' pill and a TTS callout.
+    """
+    if edge_tts is None or Image is None:
+        raise RuntimeError("edge-tts and Pillow are required for the Top-3 countdown.")
+
+    temp_dir = tempfile.mkdtemp(prefix="top3_render_")
+    try:
+        intro_path = os.path.join(temp_dir, "intro.mp4")
+        banner = f"TOP 3 {streamer_name.upper()} MOMENTS"
+        build_blurred_narrated_intro(
+            play_items[2]["path"], banner, intro_line, intro_path
+        )
+
+        callouts = {3: "Number three.", 2: "Number two.", 1: "And number one."}
+        segment_paths = []
+        for item in play_items:
+            rank = item["rank"]
+            segment_path = os.path.join(temp_dir, f"segment_{rank}.mp4")
+            callout_mp3 = os.path.join(temp_dir, f"callout_{rank}.mp3")
+            pill_png = os.path.join(temp_dir, f"pill_{rank}.png")
+
+            generate_tts_audio(callouts[rank], callout_mp3)
+            start, source_len = _pick_top3_window(
+                item.get("words") or [], item["duration"]
+            )
+            output_dur = source_len / TOP3_SEGMENT_SPEED
+            _create_pill_overlay(f"#{rank} • {item['name']}", pill_png)
+
+            filtergraph = (
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
+                f"crop=1080:1920,setsar=1,setpts=PTS/{TOP3_SEGMENT_SPEED},fps=30[sv];"
+                "[sv][1:v]overlay=(W-w)/2:90[v];"
+                f"[0:a]atempo={TOP3_SEGMENT_SPEED},aresample=44100,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo,volume=0.22[duck];"
+                "[2:a]aresample=44100,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                "adelay=120|120,volume=1.8[call];"
+                "[duck][call]amix=inputs=2:duration=first:dropout_transition=0,"
+                f"apad=whole_dur={output_dur:.3f}[a]"
+            )
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", f"{start:.3f}", "-t", f"{source_len:.3f}",
+                "-i", str(item["path"]),
+                "-loop", "1", "-i", pill_png,
+                "-i", callout_mp3,
+                "-filter_complex", filtergraph,
+                "-map", "[v]", "-map", "[a]",
+                "-t", f"{output_dur:.3f}",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                segment_path,
+            ]
+            subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+            )
+            print(
+                f"Rendered Top-3 segment #{rank} ({output_dur:.2f}s) "
+                f"from {start:.2f}s"
+            )
+            segment_paths.append(segment_path)
+
+        concat_inputs = ["-i", intro_path]
+        for path in segment_paths:
+            concat_inputs += ["-i", path]
+
+        filter_parts = []
+        for i in range(4):
+            filter_parts.append(f"[{i}:v]fps=30,format=yuv420p,setsar=1[v{i}];")
+            filter_parts.append(
+                f"[{i}:a]aresample=44100,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo[a%d];" % i
+            )
+        filter_parts.append(
+            "".join(f"[v{i}][a{i}]" for i in range(4))
+            + "concat=n=4:v=1:a=1[v][a]"
+        )
+
+        cmd = (
+            ["ffmpeg", "-y"] + concat_inputs
+            + [
+                "-filter_complex", "".join(filter_parts),
+                "-map", "[v]", "-map", "[a]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                "-movflags", "+faststart",
+                str(out_path),
+            ]
+        )
+        subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        )
+        total_dur = get_video_duration(out_path)
+        print(f"Rendered Top-3 countdown Reel ({total_dur:.2f}s): {out_path}")
+        return True
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def run_noon_top3_pipeline():
+    """Discover, render, and publish the Noon Top-3 streamer countdown Reel."""
+    if not os.environ.get("IG_USER_ID", "").strip() or not os.environ.get(
+        "IG_ACCESS_TOKEN", ""
+    ).strip():
+        print("Instagram credentials not set. Skipping Noon Top-3 Reel.")
+        return False
+
+    try:
+        token = get_twitch_token()
+        game_id = get_gta6_game_id(token)
+    except Exception as e:
+        print(f"Twitch setup failed for Noon Top-3 Reel: {e}")
+        return False
+
+    if not game_id:
+        print("Grand Theft Auto VI category not found. Cannot build Top-3 Reel.")
+        return False
+
+    try:
+        streamer_name, items = find_top3_streamer_clips(token, game_id)
+    except Exception as e:
+        print(f"Top-3 streamer discovery failed: {e}")
+        return False
+    if len(items) < 3:
+        print("No streamer with 3 unused, NudeNet-clean clips was found.")
+        return False
+
+    out_path = Path(
+        "top3_"
+        + re.sub(r"[^A-Za-z0-9]", "", streamer_name)[:24]
+        + "_reel.mp4"
+    )
+    try:
+        items.sort(key=lambda it: it["clip"].get("view_count") or 0, reverse=True)
+        # Playback order is #3 (third-highest), #2, then #1 (highest views).
+        play_items = [items[2], items[1], items[0]]
+        for idx, item in enumerate(play_items):
+            item["rank"] = 3 - idx
+
+        metadata = generate_top3_metadata(streamer_name, play_items)
+        for item in play_items:
+            item["name"] = metadata["names"][item["rank"]]
+
+        render_top3_countdown(
+            streamer_name, play_items, metadata["intro_line"], out_path
+        )
+
+        caption = (
+            f"Top 3 {streamer_name} moments 🔥\n\n"
+            f"#3 {play_items[0]['name']}\n"
+            f"#2 {play_items[1]['name']}\n"
+            f"#1 {play_items[2]['name']}\n\n"
+            "Follow for daily streamer moments!\n"
+            "#Gaming #Twitch #Reels #GTA6 #StreamerClips #GamingMoments"
+        )
+        tag_id = re.sub(r"[^A-Za-z0-9_-]", "", streamer_name)[:20] + "-top3"
+        if not upload_instagram_reel(out_path, caption, tag_id):
+            print("Instagram upload failed for the Noon Top-3 Reel.")
+            return False
+
+        increment_daily_count("ig")
+        for item in play_items:
+            mark_processed(item["clip"]["id"])
+        print(
+            "Published Noon Top-3 Reel for "
+            f"{streamer_name}: {[item['clip']['id'] for item in play_items]}"
+        )
+        return True
+    except Exception as e:
+        print(f"Noon Top-3 Reel failed: {e}")
+        return False
+    finally:
+        for item in items:
+            try:
+                Path(item["path"]).unlink()
+            except Exception:
+                pass
+        try:
+            if out_path.exists():
+                out_path.unlink()
+        except Exception:
+            pass
+
+
 def main():
     schedule = load_mc_schedule()
     yt_count, yt2_count, ig_count = get_daily_counts()
@@ -1889,9 +2699,14 @@ def main():
     today_ist = now_ist.strftime("%Y-%m-%d")
     is_morning = now_ist.hour < 12
     is_night = now_ist.hour >= 18
+    is_noon = 11 <= now_ist.hour < 17
 
     has_yt2 = bool(os.getenv("YT_REFRESH_TOKEN_2", "").strip())
     has_yt3 = bool(os.getenv("YT_REFRESH_TOKEN_3", "").strip())
+    has_ig = bool(
+        os.getenv("IG_USER_ID", "").strip()
+        and os.getenv("IG_ACCESS_TOKEN", "").strip()
+    )
 
     print(f"Today's current upload count: YouTube={yt_count}/{MAX_YT_PER_DAY}, YouTube#2={yt2_count}/{MAX_YT2_PER_DAY}, Instagram={ig_count}/{MAX_IG_PER_DAY}")
     print(f"Current IST time: {now_ist.strftime('%Y-%m-%d %H:%M')} | UPLOAD_TARGET={UPLOAD_TARGET}")
@@ -1905,7 +2720,17 @@ def main():
     run_yt3 = False
     run_yt2_mc = False
 
-    if UPLOAD_TARGET == "yt3_only":
+    if UPLOAD_TARGET == "ig_noon_only":
+        if not has_ig:
+            print("UPLOAD_TARGET=ig_noon_only: Instagram credentials are not set. Nothing to do.")
+            return
+        if ig_count >= MAX_IG_PER_DAY:
+            print("UPLOAD_TARGET=ig_noon_only: Instagram daily limit reached. Nothing to do.")
+            return
+        print("UPLOAD_TARGET=ig_noon_only: rendering the Noon Top-3 streamer countdown Reel.")
+        run_noon_top3_pipeline()
+        return
+    elif UPLOAD_TARGET == "yt3_only":
         can_upload_yt = False
         can_upload_yt2 = False
         can_upload_ig = False
@@ -1940,9 +2765,25 @@ def main():
         elif not has_yt3:
             print("YT_REFRESH_TOKEN_3 is not set. Channel #3 Minecraft scheduling disabled.")
 
+    # Noon IST: publish the Top-3 streamer countdown Reel instead of a regular IG Reel.
+    noon_top3_done = False
+    if UPLOAD_TARGET == "all" and is_noon and can_upload_ig and has_ig:
+        print("\n=== Noon Top-3 Streamer Countdown Reel ===")
+        try:
+            noon_top3_done = run_noon_top3_pipeline()
+        except Exception as e:
+            print(f"Noon Top-3 pipeline failed: {e}")
+        if noon_top3_done:
+            can_upload_ig = False
+        else:
+            print(
+                "Noon Top-3 Reel was not published; regular Instagram upload "
+                "remains available this run."
+            )
+
     gta_needed = can_upload_yt or can_upload_yt2 or can_upload_ig
 
-    if not gta_needed and not run_yt3 and not run_yt2_mc:
+    if not gta_needed and not run_yt3 and not run_yt2_mc and not noon_top3_done:
         print("No eligible upload targets for this run. Exiting cleanly.")
         return
 
@@ -1969,7 +2810,7 @@ def main():
         except Exception as e:
             print(f"GTA pipeline failed: {e}")
 
-    if not mc_uploaded and not gta_uploaded:
+    if not mc_uploaded and not gta_uploaded and not noon_top3_done:
         print("No uploads completed this run.")
 
 
