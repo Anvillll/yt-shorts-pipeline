@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import re
@@ -30,9 +31,9 @@ except ImportError:
     edge_tts = None
 
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
 except ImportError:
-    Image = ImageDraw = ImageFont = None
+    Image = ImageDraw = ImageFont = ImageOps = None
 
 PROCESSED_FILE = Path("processed.txt")
 PROCESSED = set(PROCESSED_FILE.read_text().splitlines()) if PROCESSED_FILE.exists() else set()
@@ -2728,6 +2729,497 @@ def run_noon_top3_pipeline():
             pass
 
 
+def _build_gdrive_client():
+    """Build a Google Drive v3 client from the shared Google OAuth credentials."""
+    refresh_token = (
+        os.environ.get("GDRIVE_REFRESH_TOKEN", "").strip()
+        or os.environ.get("YT_REFRESH_TOKEN", "").strip()
+    )
+    if not refresh_token:
+        print("GDRIVE_REFRESH_TOKEN / YT_REFRESH_TOKEN not set. Cannot access Google Drive.")
+        return None
+
+    client_id = os.environ.get("YT_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("YT_CLIENT_SECRET", "").strip()
+    if not client_id or not client_secret:
+        print("YT_CLIENT_ID / YT_CLIENT_SECRET not set. Cannot access Google Drive.")
+        return None
+
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+    )
+    return build("drive", "v3", credentials=creds)
+
+
+def _list_queued_carousel_folders(drive):
+    """Return unpublished IG_CAROUSEL_ folders ordered oldest first."""
+    query = (
+        "mimeType = 'application/vnd.google-apps.folder' "
+        "and name contains 'IG_CAROUSEL_' "
+        "and not name contains 'PUBLISHED_' "
+        "and trashed = false"
+    )
+    response = drive.files().list(
+        q=query,
+        orderBy="createdTime asc",
+        fields="files(id,name,createdTime)",
+        pageSize=100,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    return response.get("files", [])
+
+
+def _list_drive_folder_files(drive, folder_id):
+    """List every non-trashed item directly inside a Drive folder."""
+    response = drive.files().list(
+        q=f"'{folder_id}' in parents and trashed = false",
+        fields="files(id,name,mimeType,createdTime)",
+        pageSize=1000,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    return response.get("files", [])
+
+
+def _natural_sort_key(name):
+    """Sort slide_1, slide_2, slide_10 in human order."""
+    key = []
+    for part in re.split(r"(\d+)", name or ""):
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part.lower()))
+    return key
+
+
+def _clean_carousel_caption(raw_text):
+    """
+    Keep only the clean hook/story/CTA/hashtags from a CAPTION Google Doc.
+    Drops the 'READY-TO-POST CAPTION' marker line and everything from 'SOURCES' on.
+    """
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+
+    for index, line in enumerate(lines):
+        if "READY-TO-POST CAPTION" in line.upper():
+            lines = lines[index + 1:]
+            break
+
+    for index, line in enumerate(lines):
+        if line.strip().upper().startswith("SOURCES"):
+            lines = lines[:index]
+            break
+
+    cleaned = "\n".join(lines).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned[:2200]
+
+
+def _export_carousel_caption(drive, doc_id):
+    """Export a Google Doc as plain text and return the cleaned caption."""
+    exported = drive.files().export_media(
+        fileId=doc_id, mimeType="text/plain"
+    ).execute()
+    if isinstance(exported, bytes):
+        text = exported.decode("utf-8", errors="replace")
+    else:
+        text = str(exported)
+    return _clean_carousel_caption(text)
+
+
+def _create_temp_github_release(tag_prefix, release_name):
+    """Create a temporary public GitHub release used as an image CDN."""
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not github_token:
+        print("GITHUB_TOKEN not provided. Cannot host carousel images.")
+        return None
+
+    repo = os.environ.get("GITHUB_REPOSITORY", "Anvillll/yt-shorts-pipeline")
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    tag_name = f"{tag_prefix}-{int(time.time())}"
+
+    try:
+        response = requests.post(
+            f"https://api.github.com/repos/{repo}/releases",
+            headers=headers,
+            json={
+                "tag_name": tag_name,
+                "name": release_name,
+                "body": "Temporary release for Instagram carousel hosting.",
+                "draft": False,
+                "prerelease": True,
+            },
+            timeout=20,
+        )
+        if response.status_code >= 400:
+            print(
+                f"GitHub release creation error HTTP "
+                f"{response.status_code}: {response.text}"
+            )
+        response.raise_for_status()
+        data = response.json()
+        return {
+            "repo": repo,
+            "headers": headers,
+            "github_token": github_token,
+            "tag_name": tag_name,
+            "release_id": data["id"],
+            "upload_url": data["upload_url"].split("{")[0],
+        }
+    except Exception as e:
+        print(f"Could not create temporary GitHub release: {e}")
+        return None
+
+
+def _upload_release_asset(release_info, file_path, asset_name, content_type):
+    """Upload one file to a temporary GitHub release and return its download URL."""
+    with open(file_path, "rb") as file_obj:
+        response = requests.post(
+            f"{release_info['upload_url']}?name={asset_name}",
+            headers={
+                "Authorization": f"Bearer {release_info['github_token']}",
+                "Content-Type": content_type,
+            },
+            data=file_obj,
+            timeout=120,
+        )
+    if response.status_code >= 400:
+        print(
+            f"GitHub asset upload error HTTP "
+            f"{response.status_code}: {response.text}"
+        )
+    response.raise_for_status()
+    return response.json().get("browser_download_url")
+
+
+def _delete_temp_github_release(release_info):
+    """Delete the temporary release and its git tag, ignoring cleanup errors."""
+    if not release_info:
+        return
+    try:
+        requests.delete(
+            f"https://api.github.com/repos/{release_info['repo']}"
+            f"/releases/{release_info['release_id']}",
+            headers=release_info["headers"],
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"Failed to delete temporary release: {e}")
+    try:
+        requests.delete(
+            f"https://api.github.com/repos/{release_info['repo']}"
+            f"/git/refs/tags/{release_info['tag_name']}",
+            headers=release_info["headers"],
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"Failed to delete temporary tag: {e}")
+
+
+def _resolve_public_url(url):
+    """Resolve the GitHub release redirect to the direct public CDN URL."""
+    if not url:
+        return url
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=15)
+        if response.status_code >= 400:
+            print(
+                f"Asset HEAD error HTTP "
+                f"{response.status_code}: {response.text}"
+            )
+        return response.url or url
+    except Exception as e:
+        print(f"Could not resolve direct CDN URL ({e}); using release asset URL.")
+        return url
+
+
+def _publish_carousel_folder(drive, folder, ig_user_id, ig_access_token):
+    """Publish one Drive IG_CAROUSEL_ folder as an Instagram carousel."""
+    folder_id = folder["id"]
+    folder_name = folder.get("name") or "IG_CAROUSEL_"
+    temp_dir = Path(tempfile.mkdtemp(prefix="ig_carousel_"))
+    release_info = None
+
+    try:
+        files = _list_drive_folder_files(drive, folder_id)
+
+        caption_doc = next(
+            (
+                item for item in files
+                if item.get("mimeType") == "application/vnd.google-apps.document"
+                and "caption" in (item.get("name") or "").lower()
+            ),
+            None,
+        )
+        if not caption_doc:
+            caption_doc = next(
+                (
+                    item for item in files
+                    if item.get("mimeType") == "application/vnd.google-apps.document"
+                ),
+                None,
+            )
+        if not caption_doc:
+            print(f"No CAPTION Google Doc found in Drive folder {folder_name}.")
+            return False
+
+        caption = _export_carousel_caption(drive, caption_doc["id"])
+        if not caption:
+            print(f"CAPTION Google Doc in {folder_name} is empty after cleaning.")
+            return False
+
+        image_files = [
+            item for item in files
+            if "image/" in (item.get("mimeType") or "")
+        ]
+        image_files.sort(key=lambda item: _natural_sort_key(item.get("name")))
+        if len(image_files) < 2:
+            print(
+                f"Drive folder {folder_name} has {len(image_files)} image(s); "
+                "Instagram carousels need at least 2."
+            )
+            return False
+
+        slide_paths = []
+        for index, image_file in enumerate(image_files, start=1):
+            image_bytes = drive.files().get_media(
+                fileId=image_file["id"]
+            ).execute()
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            image = ImageOps.fit(image, (1080, 1350), method=Image.LANCZOS)
+            slide_path = temp_dir / f"slide_{index}.jpg"
+            image.save(slide_path, "JPEG", quality=95)
+            slide_paths.append(slide_path)
+            print(
+                f"Prepared carousel slide {index}: "
+                f"{image_file.get('name')} -> {slide_path.name}"
+            )
+
+        release_info = _create_temp_github_release(
+            tag_prefix=f"temp-carousel-{folder_id}",
+            release_name=f"Temp Carousel {folder_name}",
+        )
+        if not release_info:
+            return False
+
+        image_urls = []
+        for index, slide_path in enumerate(slide_paths, start=1):
+            asset_url = _upload_release_asset(
+                release_info,
+                slide_path,
+                f"slide_{index}.jpg",
+                "image/jpeg",
+            )
+            image_urls.append(_resolve_public_url(asset_url))
+            print(f"Uploaded carousel slide {index} to temporary CDN.")
+
+        # Give GitHub's asset CDN a moment before Meta fetches the images.
+        time.sleep(2)
+
+        container_url = (
+            f"https://graph.facebook.com/v21.0/{ig_user_id}/media"
+        )
+        child_ids = []
+        for index, image_url in enumerate(image_urls, start=1):
+            response = requests.post(
+                container_url,
+                data={
+                    "image_url": image_url,
+                    "is_carousel_item": "true",
+                    "access_token": ig_access_token,
+                },
+                timeout=30,
+            )
+            if response.status_code >= 400:
+                print(
+                    f"Instagram carousel item {index} error HTTP "
+                    f"{response.status_code}: {response.text}"
+                )
+            response.raise_for_status()
+            child_id = response.json().get("id")
+            if not child_id:
+                raise RuntimeError(
+                    f"Instagram did not return a carousel item ID for slide {index}."
+                )
+            child_ids.append(child_id)
+            print(f"Created Instagram carousel item {index}: {child_id}")
+
+        print("Creating Instagram CAROUSEL container...")
+        parent_response = requests.post(
+            container_url,
+            data={
+                "media_type": "CAROUSEL",
+                "children": ",".join(child_ids),
+                "caption": caption,
+                "access_token": ig_access_token,
+            },
+            timeout=30,
+        )
+        if parent_response.status_code >= 400:
+            print(
+                f"Instagram carousel container error HTTP "
+                f"{parent_response.status_code}: {parent_response.text}"
+            )
+        parent_response.raise_for_status()
+        creation_id = parent_response.json().get("id")
+        print(f"Instagram carousel container created: {creation_id}")
+
+        status_url = f"https://graph.facebook.com/v21.0/{creation_id}"
+        poll_start = time.time()
+        is_ready = False
+        while time.time() - poll_start < 90:
+            time.sleep(5)
+            status_response = requests.get(
+                status_url,
+                params={
+                    "fields": "status_code",
+                    "access_token": ig_access_token,
+                },
+                timeout=15,
+            )
+            if status_response.status_code >= 400:
+                print(
+                    f"Instagram carousel status error HTTP "
+                    f"{status_response.status_code}: {status_response.text}"
+                )
+            status_response.raise_for_status()
+            status_code = status_response.json().get("status_code")
+            print(f"Instagram carousel status: {status_code}")
+            if status_code == "FINISHED":
+                is_ready = True
+                break
+            if status_code == "ERROR":
+                raise RuntimeError(
+                    f"Instagram carousel processing failed: "
+                    f"{status_response.text}"
+                )
+
+        if not is_ready:
+            raise TimeoutError(
+                "Timed out waiting for Instagram carousel container to finish processing."
+            )
+
+        print("Publishing Instagram carousel...")
+        publish_response = requests.post(
+            f"https://graph.facebook.com/v21.0/{ig_user_id}/media_publish",
+            data={
+                "creation_id": creation_id,
+                "access_token": ig_access_token,
+            },
+            timeout=30,
+        )
+        if publish_response.status_code >= 400:
+            print(
+                f"Instagram carousel publish error HTTP "
+                f"{publish_response.status_code}: {publish_response.text}"
+            )
+        publish_response.raise_for_status()
+        published_id = publish_response.json().get("id")
+        print(f"Successfully published Instagram carousel! Post ID: {published_id}")
+
+        # Mark the folder as published so it is never picked up again.
+        new_name = f"PUBLISHED_{folder_name}"
+        renamed = False
+        for attempt in range(3):
+            try:
+                drive.files().update(
+                    fileId=folder_id,
+                    body={"name": new_name},
+                    supportsAllDrives=True,
+                ).execute()
+                renamed = True
+                break
+            except Exception as e:
+                print(
+                    f"Drive folder rename attempt {attempt + 1} failed: {e}"
+                )
+                time.sleep(2)
+        if renamed:
+            print(f"Renamed Drive folder to {new_name}")
+        else:
+            print(
+                f"WARNING: Carousel published but folder {folder_name} could not "
+                "be renamed; it may be published again."
+            )
+
+        try:
+            increment_daily_count("ig")
+        except Exception as e:
+            print(f"Could not increment Instagram daily count: {e}")
+
+        return True
+    finally:
+        _delete_temp_github_release(release_info)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def process_gdrive_ig_carousel():
+    """
+    Publish the oldest queued IG_CAROUSEL_ folder from Google Drive.
+    Returns True when a carousel was successfully published.
+    """
+    ig_user_id = os.environ.get("IG_USER_ID", "").strip()
+    ig_access_token = os.environ.get("IG_ACCESS_TOKEN", "").strip()
+    if not ig_user_id or not ig_access_token:
+        print("Instagram credentials (IG_USER_ID / IG_ACCESS_TOKEN) not set. Skipping carousel.")
+        return False
+
+    if not os.environ.get("GITHUB_TOKEN", "").strip():
+        print("GITHUB_TOKEN not provided. Cannot host carousel images.")
+        return False
+
+    if Image is None or ImageOps is None:
+        print("Pillow is required to prepare Google Drive carousel slides.")
+        return False
+
+    try:
+        drive = _build_gdrive_client()
+    except Exception as e:
+        print(f"Could not build Google Drive client: {e}")
+        return False
+    if not drive:
+        return False
+
+    try:
+        folders = _list_queued_carousel_folders(drive)
+    except Exception as e:
+        print(f"Could not list Google Drive carousel folders: {e}")
+        return False
+
+    if not folders:
+        print("No queued IG_CAROUSEL_ folders found on Google Drive.")
+        return False
+
+    for folder in folders:
+        print(
+            f"\nChecking Drive carousel folder: "
+            f"{folder.get('name')} ({folder.get('id')})"
+        )
+        try:
+            if _publish_carousel_folder(
+                drive, folder, ig_user_id, ig_access_token
+            ):
+                return True
+        except Exception as e:
+            print(
+                f"Carousel folder {folder.get('name')} failed: "
+                f"{type(e).__name__}: {e}"
+            )
+            continue
+
+    print("No queued Drive carousel could be published.")
+    return False
+
+
 def main():
     schedule = load_mc_schedule()
     yt_count, yt2_count, ig_count = get_daily_counts()
@@ -2757,7 +3249,17 @@ def main():
     run_yt3 = False
     run_yt2_mc = False
 
-    if UPLOAD_TARGET == "ig_noon_only":
+    if UPLOAD_TARGET == "ig_carousel_only":
+        if not has_ig:
+            print("UPLOAD_TARGET=ig_carousel_only: Instagram credentials are not set. Nothing to do.")
+            return
+        if ig_count >= MAX_IG_PER_DAY:
+            print("UPLOAD_TARGET=ig_carousel_only: Instagram daily limit reached. Nothing to do.")
+            return
+        print("UPLOAD_TARGET=ig_carousel_only: publishing the oldest queued Google Drive carousel.")
+        process_gdrive_ig_carousel()
+        return
+    elif UPLOAD_TARGET == "ig_noon_only":
         if not has_ig:
             print("UPLOAD_TARGET=ig_noon_only: Instagram credentials are not set. Nothing to do.")
             return
@@ -2802,6 +3304,18 @@ def main():
         elif not has_yt3:
             print("YT_REFRESH_TOKEN_3 is not set. Channel #3 Minecraft scheduling disabled.")
 
+    # Normal runs: prioritize queued Google Drive carousels before regular IG work.
+    carousel_published = False
+    if UPLOAD_TARGET == "all" and can_upload_ig and has_ig:
+        print("\n=== Google Drive Instagram Carousel Queue ===")
+        try:
+            carousel_published = process_gdrive_ig_carousel()
+        except Exception as e:
+            print(f"Google Drive carousel publisher failed: {e}")
+        if carousel_published:
+            can_upload_ig = False
+            _, _, ig_count = get_daily_counts()
+
     # Noon IST: publish the Top-3 streamer countdown Reel instead of a regular IG Reel.
     noon_top3_done = False
     if UPLOAD_TARGET == "all" and is_noon and can_upload_ig and has_ig:
@@ -2820,7 +3334,13 @@ def main():
 
     gta_needed = can_upload_yt or can_upload_yt2 or can_upload_ig
 
-    if not gta_needed and not run_yt3 and not run_yt2_mc and not noon_top3_done:
+    if (
+        not gta_needed
+        and not run_yt3
+        and not run_yt2_mc
+        and not noon_top3_done
+        and not carousel_published
+    ):
         print("No eligible upload targets for this run. Exiting cleanly.")
         return
 
@@ -2847,7 +3367,12 @@ def main():
         except Exception as e:
             print(f"GTA pipeline failed: {e}")
 
-    if not mc_uploaded and not gta_uploaded and not noon_top3_done:
+    if (
+        not mc_uploaded
+        and not gta_uploaded
+        and not noon_top3_done
+        and not carousel_published
+    ):
         print("No uploads completed this run.")
 
 
